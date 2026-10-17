@@ -1,7 +1,8 @@
-// Parte de la API pública de `core` (CRUD de lectura, selección por clic, etc.)
-// la consumirán `gui/` (Fase 3) y `export.rs` (Fase 4).
+// Parte del CRUD de lectura de `core` (get_match, logs_for_match…) sólo la usan los
+// tests por ahora; la consumirá `export.rs` en la Fase 4.
 #[allow(dead_code)]
 mod core;
+mod gui;
 mod tui;
 
 use std::path::PathBuf;
@@ -47,8 +48,7 @@ fn main() -> Result<()> {
         print_summary(&AppState::load(&db)?);
         Ok(())
     } else if cli.gui {
-        println!("La interfaz de escritorio (--gui) llega en la Fase 3. Usa --tui por ahora.");
-        Ok(())
+        gui::run(db)
     } else {
         tui::run(db)
     }
