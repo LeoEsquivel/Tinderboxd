@@ -1,0 +1,178 @@
+// Fase 1: buena parte de la API de `core` la consumirán `tui/` y `gui/` en las
+// fases 2 y 3; hasta entonces silenciamos los avisos de código sin usar.
+#[allow(dead_code)]
+mod core;
+
+use std::path::PathBuf;
+
+use anyhow::Result;
+use clap::Parser;
+
+use crate::core::db::{DEFAULT_DB_PATH, Database};
+use crate::core::models::{format_score_dots, format_stars};
+use crate::core::state::AppState;
+
+/// Tinderboxd: tu Letterboxd de matches y citas.
+#[derive(Parser, Debug)]
+#[command(name = "tinderboxd", version, about)]
+struct Cli {
+    /// Lanza la interfaz de terminal (ratatui).
+    #[arg(long, conflicts_with = "gui")]
+    tui: bool,
+
+    /// Lanza la interfaz de escritorio (egui).
+    #[arg(long)]
+    gui: bool,
+
+    /// Ruta del archivo SQLite.
+    #[arg(long, default_value = DEFAULT_DB_PATH)]
+    db: PathBuf,
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+
+    let db = Database::open(&cli.db)?;
+    if db.seed_if_empty()? {
+        println!("🌱 Base de datos nueva: datos de ejemplo insertados en {}", cli.db.display());
+    }
+    let state = AppState::load(&db)?;
+
+    print_summary(&state);
+
+    if cli.tui {
+        println!("\n(--tui) La interfaz de terminal llega en la Fase 2.");
+    } else if cli.gui {
+        println!("\n(--gui) La interfaz de escritorio llega en la Fase 3.");
+    }
+    Ok(())
+}
+
+/// Volcado de verificación de la capa `core` (temporal, Fase 1).
+fn print_summary(state: &AppState) {
+    println!("\n══════════════ TINDERBOXD · resumen de la Fase 1 ══════════════");
+
+    println!("\n★ TOP 4 FAVORITOS");
+    for card in state.favorites() {
+        println!("  ♥ {}  {}", card.profile.headline(), card.avg_stars());
+    }
+
+    println!("\n🎬 CARTELERA ({} matches)", state.cards.len());
+    for card in &state.cards {
+        let p = &card.profile;
+        println!(
+            "  [{:>2}] {:<32} {:<7} {:<15} {:<6} {} {}",
+            p.id,
+            p.alias,
+            p.platform.as_str(),
+            p.status.as_str(),
+            card.avg_stars(),
+            if card.liked { "♥" } else { " " },
+            if p.is_favorite { "(Top 4)" } else { "" },
+        );
+        if let Some(bio) = &p.bio_highlight {
+            println!("       “{bio}”");
+        }
+        if !card.tags.is_empty() {
+            let tags: Vec<String> = card.tags.iter().map(|t| t.label()).collect();
+            println!("       {}", tags.join("  "));
+        }
+    }
+
+    println!("\n⏳ WATCHLIST");
+    for card in state.watchlist_cards() {
+        println!("  · {}", card.profile.headline());
+    }
+
+    println!("\n📔 DIARY ({} entradas)", state.diary.len());
+    for e in &state.diary {
+        let l = &e.log;
+        println!(
+            "  {}  {:<30} {:<13} {:<6} {}{}",
+            l.date_logged,
+            e.match_alias,
+            l.interaction_type.as_str(),
+            l.rating.stars(),
+            l.heart(),
+            if l.contains_spoilers { "  ⚠ spoilers" } else { "" },
+        );
+        println!("             {}", l.sub_scores_line());
+        if let Some(text) = &l.review_text {
+            println!("             {}", truncate(text, 100));
+        }
+    }
+
+    println!("\n📜 LISTAS");
+    for list in &state.lists {
+        println!(
+            "  {} {}",
+            list.title,
+            if list.is_ranked { "(ranking)" } else { "" }
+        );
+        if let Some(desc) = &list.description {
+            println!("    {desc}");
+        }
+        for entry in state.entries_of_list(list.id) {
+            println!(
+                "    {}. {} — {}",
+                entry.item.rank_order,
+                entry.profile.alias,
+                entry.item.item_note.as_deref().unwrap_or("")
+            );
+        }
+    }
+
+    let s = &state.stats;
+    println!("\n📊 STATS");
+    println!(
+        "  {} matches · {} reseñas · {} con ♥ · promedio {} ({:.1}/5)",
+        s.total_matches,
+        s.total_logs,
+        s.liked_logs,
+        s.average_stars(),
+        s.average_rating.unwrap_or(0.0) / 2.0
+    );
+
+    println!("\n  Distribución de calificaciones");
+    let max = s.max_bucket().max(1);
+    for (i, count) in s.rating_distribution.iter().enumerate() {
+        let bar = "█".repeat((*count * 20 / max) as usize);
+        println!("  {:>6} │{:<20} {}", format_stars(i as u8 + 1), bar, count);
+    }
+
+    println!("\n  Embudo de supervivencia");
+    for step in &s.funnel {
+        let bar = "▇".repeat((step.pct_of_total / 5.0).round() as usize);
+        println!("  {:<13} {:<20} {:>2} ({:>5.1}%)", step.label, bar, step.count, step.pct_of_total);
+    }
+    println!(
+        "  Chat → Primera Cita: {:.0}%   ·   Chat → Ghosting: {:.0}%",
+        s.chat_to_date_pct.unwrap_or(0.0),
+        s.ghosting_pct.unwrap_or(0.0)
+    );
+
+    println!("\n  Por estado");
+    for (status, count) in &s.status_counts {
+        println!("  {:<15} {}", status.as_str(), count);
+    }
+
+    println!("\n  Top Red Flags");
+    for tc in &s.top_red_flags {
+        println!("  {} ×{}", tc.tag.label(), tc.count);
+    }
+    println!("\n  Top Green Flags");
+    for tc in &s.top_green_flags {
+        println!("  {} ×{}", tc.tag.label(), tc.count);
+    }
+
+    println!("\n  Leyenda sub-métricas: 3/5 = {}", format_score_dots(3));
+}
+
+fn truncate(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        text.to_string()
+    } else {
+        let cut: String = text.chars().take(max_chars).collect();
+        format!("{cut}…")
+    }
+}

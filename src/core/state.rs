@@ -1,0 +1,1133 @@
+//! Estado de la aplicación compartido por la TUI y la GUI.
+//!
+//! `AppState` no conoce `egui` ni `ratatui`: guarda una caché de los datos de
+//! `Database`, la pestaña activa, la selección, los filtros y los borradores de
+//! formularios. Los frontends sólo traducen eventos a llamadas de estos métodos
+//! y pintan lo que exponen.
+
+use std::collections::{BTreeSet, HashMap};
+
+use anyhow::Result;
+use chrono::{Local, NaiveDate};
+
+use super::db::{Database, MAX_FAVORITES};
+use super::models::*;
+
+// ---------------------------------------------------------------------------
+// Pestañas
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum Tab {
+    #[default]
+    Dashboard,
+    Cartelera,
+    Watchlist,
+    Diary,
+    Lists,
+    Stats,
+}
+
+impl Tab {
+    pub const ALL: [Tab; 6] =
+        [Tab::Dashboard, Tab::Cartelera, Tab::Watchlist, Tab::Diary, Tab::Lists, Tab::Stats];
+
+    pub fn title(&self) -> &'static str {
+        match self {
+            Tab::Dashboard => "Perfil",
+            Tab::Cartelera => "Cartelera",
+            Tab::Watchlist => "Watchlist",
+            Tab::Diary => "Diary",
+            Tab::Lists => "Listas",
+            Tab::Stats => "Stats",
+        }
+    }
+
+    pub fn index(&self) -> usize {
+        Tab::ALL.iter().position(|t| t == self).unwrap_or(0)
+    }
+
+    pub fn next(&self) -> Tab {
+        Tab::ALL[(self.index() + 1) % Tab::ALL.len()]
+    }
+
+    pub fn prev(&self) -> Tab {
+        Tab::ALL[(self.index() + Tab::ALL.len() - 1) % Tab::ALL.len()]
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Filtros de la Cartelera / Watchlist
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum SortBy {
+    #[default]
+    MatchDate,
+    Rating,
+    LastLogged,
+    Alias,
+}
+
+impl SortBy {
+    pub const ALL: [SortBy; 4] = [SortBy::MatchDate, SortBy::Rating, SortBy::LastLogged, SortBy::Alias];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SortBy::MatchDate => "Fecha de match",
+            SortBy::Rating => "Rating promedio",
+            SortBy::LastLogged => "Última interacción",
+            SortBy::Alias => "Alias (A-Z)",
+        }
+    }
+
+    pub fn next(&self) -> SortBy {
+        let i = SortBy::ALL.iter().position(|s| s == self).unwrap_or(0);
+        SortBy::ALL[(i + 1) % SortBy::ALL.len()]
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Filters {
+    /// Búsqueda libre sobre alias, bio y tags (sin distinguir mayúsculas).
+    pub search: String,
+    pub platform: Option<Platform>,
+    pub status: Option<MatchStatus>,
+    pub tag_id: Option<i64>,
+    pub only_liked: bool,
+    pub only_favorites: bool,
+    pub sort: SortBy,
+}
+
+impl Filters {
+    pub fn is_active(&self) -> bool {
+        !self.search.trim().is_empty()
+            || self.platform.is_some()
+            || self.status.is_some()
+            || self.tag_id.is_some()
+            || self.only_liked
+            || self.only_favorites
+    }
+
+    /// Limpia los filtros conservando el orden elegido.
+    pub fn clear(&mut self) {
+        *self = Filters { sort: self.sort, ..Filters::default() };
+    }
+
+    /// Cicla el filtro de plataforma: Todas → Tinder → ... → IRL → Todas.
+    pub fn cycle_platform(&mut self) {
+        self.platform = cycle_option(self.platform, Platform::ALL);
+    }
+
+    /// Cicla el filtro de estado: Todos → Watchlist → ... → Solo Amigos → Todos.
+    pub fn cycle_status(&mut self) {
+        self.status = cycle_option(self.status, MatchStatus::ALL);
+    }
+
+    pub fn matches(&self, card: &MatchCard) -> bool {
+        let p = &card.profile;
+        let query = self.search.trim().to_lowercase();
+        let text_ok = query.is_empty()
+            || p.alias.to_lowercase().contains(&query)
+            || p.bio_highlight.as_deref().unwrap_or("").to_lowercase().contains(&query)
+            || card.tags.iter().any(|t| t.name.to_lowercase().contains(&query));
+
+        text_ok
+            && self.platform.is_none_or(|pl| p.platform == pl)
+            && self.status.is_none_or(|st| p.status == st)
+            && self.tag_id.is_none_or(|id| card.tags.iter().any(|t| t.id == id))
+            && (!self.only_liked || card.liked)
+            && (!self.only_favorites || p.is_favorite)
+    }
+
+    /// Filtra y ordena las tarjetas.
+    pub fn apply<'a>(&self, cards: &'a [MatchCard]) -> Vec<&'a MatchCard> {
+        let mut out: Vec<&MatchCard> = cards.iter().filter(|c| self.matches(c)).collect();
+        match self.sort {
+            // `cards` ya viene ordenado por fecha de match desde la BD.
+            SortBy::MatchDate => {}
+            SortBy::Rating => out.sort_by(|a, b| {
+                b.avg_rating.unwrap_or(0.0).total_cmp(&a.avg_rating.unwrap_or(0.0))
+            }),
+            SortBy::LastLogged => out.sort_by_key(|c| std::cmp::Reverse(c.last_logged)),
+            SortBy::Alias => {
+                out.sort_by_key(|c| c.profile.alias.to_lowercase());
+            }
+        }
+        out
+    }
+}
+
+fn cycle_option<T: Copy + PartialEq>(current: Option<T>, all: &[T]) -> Option<T> {
+    match current {
+        None => all.first().copied(),
+        Some(v) => {
+            let i = all.iter().position(|x| *x == v).unwrap_or(0);
+            all.get(i + 1).copied()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Borradores de formularios
+// ---------------------------------------------------------------------------
+
+fn parse_optional_date(field: &str, raw: &str) -> Result<Option<NaiveDate>, String> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return Ok(None);
+    }
+    NaiveDate::parse_from_str(raw, "%Y-%m-%d")
+        .map(Some)
+        .map_err(|_| format!("{field}: usa el formato AAAA-MM-DD (recibido '{raw}')"))
+}
+
+fn non_empty(s: &str) -> Option<String> {
+    let s = s.trim();
+    (!s.is_empty()).then(|| s.to_string())
+}
+
+pub fn today() -> NaiveDate {
+    Local::now().date_naive()
+}
+
+/// Borrador para crear o editar un match.
+#[derive(Debug, Clone, PartialEq)]
+pub struct MatchDraft {
+    pub editing_id: Option<i64>,
+    pub alias: String,
+    pub age: String,
+    pub platform: Platform,
+    pub bio_highlight: String,
+    pub avatar_path: String,
+    pub match_date: String,
+    pub status: MatchStatus,
+    pub is_favorite: bool,
+    pub tag_ids: BTreeSet<i64>,
+}
+
+impl Default for MatchDraft {
+    fn default() -> Self {
+        MatchDraft {
+            editing_id: None,
+            alias: String::new(),
+            age: String::new(),
+            platform: Platform::Tinder,
+            bio_highlight: String::new(),
+            avatar_path: String::new(),
+            match_date: today().format("%Y-%m-%d").to_string(),
+            status: MatchStatus::Watchlist,
+            is_favorite: false,
+            tag_ids: BTreeSet::new(),
+        }
+    }
+}
+
+impl MatchDraft {
+    pub fn from_card(card: &MatchCard) -> Self {
+        let p = &card.profile;
+        MatchDraft {
+            editing_id: Some(p.id),
+            alias: p.alias.clone(),
+            age: p.age.map(|a| a.to_string()).unwrap_or_default(),
+            platform: p.platform,
+            bio_highlight: p.bio_highlight.clone().unwrap_or_default(),
+            avatar_path: p.avatar_path.clone().unwrap_or_default(),
+            match_date: p.match_date.map(|d| d.format("%Y-%m-%d").to_string()).unwrap_or_default(),
+            status: p.status,
+            is_favorite: p.is_favorite,
+            tag_ids: card.tags.iter().map(|t| t.id).collect(),
+        }
+    }
+
+    pub fn toggle_tag(&mut self, tag_id: i64) {
+        if !self.tag_ids.remove(&tag_id) {
+            self.tag_ids.insert(tag_id);
+        }
+    }
+
+    pub fn to_profile(&self) -> Result<MatchProfile, String> {
+        let alias = non_empty(&self.alias).ok_or("El alias es obligatorio")?;
+        let age = match self.age.trim() {
+            "" => None,
+            raw => {
+                let age: u32 = raw.parse().map_err(|_| format!("Edad inválida: '{raw}'"))?;
+                if !(18..=120).contains(&age) {
+                    return Err(format!("La edad debe estar entre 18 y 120 (recibido {age})"));
+                }
+                Some(age)
+            }
+        };
+        Ok(MatchProfile {
+            id: self.editing_id.unwrap_or(0),
+            alias,
+            age,
+            platform: self.platform,
+            bio_highlight: non_empty(&self.bio_highlight),
+            avatar_path: non_empty(&self.avatar_path),
+            match_date: parse_optional_date("Fecha de match", &self.match_date)?,
+            status: self.status,
+            is_favorite: self.is_favorite,
+        })
+    }
+}
+
+/// Sub-métricas de una reseña.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubScore {
+    Script,
+    Cinematography,
+    Direction,
+}
+
+impl SubScore {
+    pub const ALL: [SubScore; 3] = [SubScore::Script, SubScore::Cinematography, SubScore::Direction];
+
+    pub fn label(&self) -> &'static str {
+        match self {
+            SubScore::Script => "Guion (conversación)",
+            SubScore::Cinematography => "Fotografía (fidelidad a sus fotos)",
+            SubScore::Direction => "Dirección (química e iniciativa)",
+        }
+    }
+}
+
+/// Borrador para crear o editar una reseña (log).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewDraft {
+    pub editing_id: Option<i64>,
+    pub match_id: Option<i64>,
+    pub interaction_type: InteractionType,
+    pub date_logged: String,
+    /// 1..=10 medias estrellas.
+    pub rating: u8,
+    pub script_score: Option<u8>,
+    pub cinematography_score: Option<u8>,
+    pub direction_score: Option<u8>,
+    pub liked: bool,
+    pub review_text: String,
+    pub contains_spoilers: bool,
+}
+
+impl Default for ReviewDraft {
+    fn default() -> Self {
+        ReviewDraft {
+            editing_id: None,
+            match_id: None,
+            interaction_type: InteractionType::Chat,
+            date_logged: today().format("%Y-%m-%d").to_string(),
+            rating: 6,
+            script_score: None,
+            cinematography_score: None,
+            direction_score: None,
+            liked: false,
+            review_text: String::new(),
+            contains_spoilers: false,
+        }
+    }
+}
+
+impl ReviewDraft {
+    pub fn for_match(match_id: i64) -> Self {
+        ReviewDraft { match_id: Some(match_id), ..ReviewDraft::default() }
+    }
+
+    pub fn from_log(log: &InteractionLog) -> Self {
+        ReviewDraft {
+            editing_id: Some(log.id),
+            match_id: Some(log.match_id),
+            interaction_type: log.interaction_type,
+            date_logged: log.date_logged.format("%Y-%m-%d").to_string(),
+            rating: log.rating.value(),
+            script_score: log.script_score,
+            cinematography_score: log.cinematography_score,
+            direction_score: log.direction_score,
+            liked: log.liked,
+            review_text: log.review_text.clone().unwrap_or_default(),
+            contains_spoilers: log.contains_spoilers,
+        }
+    }
+
+    /// Sube o baja el rating en medias estrellas, dentro de 1..=10.
+    pub fn adjust_rating(&mut self, delta: i32) {
+        self.rating = Rating::clamped(self.rating as i32 + delta).value();
+    }
+
+    pub fn rating_stars(&self) -> String {
+        format_stars(self.rating)
+    }
+
+    pub fn score(&self, which: SubScore) -> Option<u8> {
+        match which {
+            SubScore::Script => self.script_score,
+            SubScore::Cinematography => self.cinematography_score,
+            SubScore::Direction => self.direction_score,
+        }
+    }
+
+    pub fn set_score(&mut self, which: SubScore, value: Option<u8>) {
+        let value = value.map(|v| v.clamp(1, 5));
+        match which {
+            SubScore::Script => self.script_score = value,
+            SubScore::Cinematography => self.cinematography_score = value,
+            SubScore::Direction => self.direction_score = value,
+        }
+    }
+
+    /// Ajusta una sub-métrica: bajar de 1 la deja vacía, subir desde vacía empieza en 1.
+    pub fn adjust_score(&mut self, which: SubScore, delta: i32) {
+        let next = match self.score(which) {
+            None if delta > 0 => Some(1),
+            None => None,
+            Some(v) => {
+                let n = v as i32 + delta;
+                (n >= 1).then(|| n.min(5) as u8)
+            }
+        };
+        self.set_score(which, next);
+    }
+
+    pub fn to_log(&self) -> Result<InteractionLog, String> {
+        let match_id = self.match_id.ok_or("Elige el match al que pertenece la reseña")?;
+        let date_logged = parse_optional_date("Fecha", &self.date_logged)?
+            .ok_or("La fecha de la interacción es obligatoria")?;
+        Ok(InteractionLog {
+            id: self.editing_id.unwrap_or(0),
+            match_id,
+            interaction_type: self.interaction_type,
+            date_logged,
+            rating: Rating::new(self.rating)?,
+            script_score: self.script_score,
+            cinematography_score: self.cinematography_score,
+            direction_score: self.direction_score,
+            liked: self.liked,
+            review_text: non_empty(&self.review_text),
+            contains_spoilers: self.contains_spoilers,
+        })
+    }
+}
+
+/// Borrador para crear o editar una lista temática.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListDraft {
+    pub editing_id: Option<i64>,
+    pub title: String,
+    pub description: String,
+    pub is_ranked: bool,
+}
+
+impl ListDraft {
+    pub fn from_list(list: &CustomList) -> Self {
+        ListDraft {
+            editing_id: Some(list.id),
+            title: list.title.clone(),
+            description: list.description.clone().unwrap_or_default(),
+            is_ranked: list.is_ranked,
+        }
+    }
+
+    pub fn to_list(&self) -> Result<CustomList, String> {
+        Ok(CustomList {
+            id: self.editing_id.unwrap_or(0),
+            title: non_empty(&self.title).ok_or("La lista necesita un título")?,
+            description: non_empty(&self.description),
+            is_ranked: self.is_ranked,
+        })
+    }
+}
+
+/// Borrador para crear un tag (flag).
+#[derive(Debug, Clone, PartialEq)]
+pub struct TagDraft {
+    pub name: String,
+    pub category: TagCategory,
+}
+
+impl Default for TagDraft {
+    fn default() -> Self {
+        TagDraft { name: String::new(), category: TagCategory::RedFlag }
+    }
+}
+
+/// Borrador para añadir un match a una lista.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ListItemDraft {
+    pub list_id: i64,
+    pub match_id: Option<i64>,
+    pub note: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeleteTarget {
+    Match(i64),
+    Log(i64),
+    List(i64),
+    ListItem { list_id: i64, match_id: i64 },
+    Tag(i64),
+}
+
+/// Ventana modal abierta (formularios y confirmaciones).
+#[derive(Debug, Clone, PartialEq)]
+pub enum Modal {
+    MatchForm(MatchDraft),
+    ReviewForm(ReviewDraft),
+    ListForm(ListDraft),
+    ListItemForm(ListItemDraft),
+    TagForm(TagDraft),
+    ConfirmDelete(DeleteTarget),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusMessage {
+    pub text: String,
+    pub is_error: bool,
+}
+
+// ---------------------------------------------------------------------------
+// AppState
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Default)]
+pub struct AppState {
+    pub active_tab: Tab,
+    pub filters: Filters,
+
+    // Caché de datos (se recarga con `refresh`).
+    pub cards: Vec<MatchCard>,
+    pub diary: Vec<DiaryEntry>,
+    pub lists: Vec<CustomList>,
+    pub list_entries: HashMap<i64, Vec<ListEntry>>,
+    pub tags: Vec<Tag>,
+    pub stats: StatsSummary,
+
+    // Selección.
+    pub selected_match: Option<i64>,
+    pub selected_log: Option<i64>,
+    pub selected_list: Option<i64>,
+    /// Cursor de cada pestaña (índice en su lista visible).
+    pub cursors: [usize; Tab::ALL.len()],
+
+    pub modal: Option<Modal>,
+    pub status: Option<StatusMessage>,
+    pub should_quit: bool,
+}
+
+/// Número de logs recientes que muestra el Dashboard.
+pub const RECENT_LOGS: usize = 5;
+
+impl AppState {
+    pub fn load(db: &Database) -> Result<Self> {
+        let mut state = AppState::default();
+        state.refresh(db)?;
+        Ok(state)
+    }
+
+    /// Recarga la caché desde la base de datos conservando la selección cuando sigue existiendo.
+    pub fn refresh(&mut self, db: &Database) -> Result<()> {
+        self.cards = db.match_cards()?;
+        self.diary = db.diary(None)?;
+        self.lists = db.list_lists()?;
+        self.list_entries = self
+            .lists
+            .iter()
+            .map(|l| Ok((l.id, db.list_entries(l.id)?)))
+            .collect::<Result<_>>()?;
+        self.tags = db.list_tags()?;
+        self.stats = db.stats()?;
+
+        if self.selected_match.is_some_and(|id| self.card(id).is_none()) {
+            self.selected_match = None;
+        }
+        if self.selected_log.is_some_and(|id| self.log(id).is_none()) {
+            self.selected_log = None;
+        }
+        if self.selected_list.is_some_and(|id| !self.lists.iter().any(|l| l.id == id)) {
+            self.selected_list = None;
+        }
+        for tab in Tab::ALL {
+            self.clamp_cursor(tab);
+        }
+        self.align_cursor_to_selection();
+        Ok(())
+    }
+
+    /// Tras recargar, lleva el cursor de la pestaña activa al elemento seleccionado.
+    /// Si esa pestaña aún no tiene selección, la toma del cursor.
+    fn align_cursor_to_selection(&mut self) {
+        let (tracked, pos) = match self.active_tab {
+            Tab::Cartelera => (
+                self.selected_match,
+                self.visible_cards().iter().position(|c| Some(c.profile.id) == self.selected_match),
+            ),
+            Tab::Watchlist => (
+                self.selected_match,
+                self.watchlist_cards().iter().position(|c| Some(c.profile.id) == self.selected_match),
+            ),
+            Tab::Dashboard => (
+                self.selected_log,
+                self.recent_logs().iter().position(|e| Some(e.log.id) == self.selected_log),
+            ),
+            Tab::Diary => (
+                self.selected_log,
+                self.diary.iter().position(|e| Some(e.log.id) == self.selected_log),
+            ),
+            Tab::Lists => (
+                self.selected_list,
+                self.lists.iter().position(|l| Some(l.id) == self.selected_list),
+            ),
+            Tab::Stats => (None, None),
+        };
+        match (tracked, pos) {
+            (_, Some(pos)) => self.cursors[self.active_tab.index()] = pos,
+            (None, None) => self.sync_selection(),
+            // Selección válida pero fuera de esta pestaña (p. ej. un match recién creado
+            // que no aparece en el Dashboard): se respeta.
+            (Some(_), None) => {}
+        }
+    }
+
+    // -------------------------------------------------------------- consultas
+
+    pub fn card(&self, match_id: i64) -> Option<&MatchCard> {
+        self.cards.iter().find(|c| c.profile.id == match_id)
+    }
+
+    pub fn log(&self, log_id: i64) -> Option<&DiaryEntry> {
+        self.diary.iter().find(|e| e.log.id == log_id)
+    }
+
+    pub fn selected_card(&self) -> Option<&MatchCard> {
+        self.selected_match.and_then(|id| self.card(id))
+    }
+
+    pub fn selected_entry(&self) -> Option<&DiaryEntry> {
+        self.selected_log.and_then(|id| self.log(id))
+    }
+
+    pub fn selected_list(&self) -> Option<&CustomList> {
+        self.selected_list.and_then(|id| self.lists.iter().find(|l| l.id == id))
+    }
+
+    pub fn entries_of_list(&self, list_id: i64) -> &[ListEntry] {
+        self.list_entries.get(&list_id).map(Vec::as_slice).unwrap_or(&[])
+    }
+
+    /// Logs de un match en orden cronológico (desde la caché del Diary).
+    pub fn logs_for(&self, match_id: i64) -> Vec<&InteractionLog> {
+        let mut logs: Vec<&InteractionLog> =
+            self.diary.iter().filter(|e| e.log.match_id == match_id).map(|e| &e.log).collect();
+        logs.reverse();
+        logs
+    }
+
+    /// El "Top 4" del perfil.
+    pub fn favorites(&self) -> Vec<&MatchCard> {
+        self.cards.iter().filter(|c| c.profile.is_favorite).take(MAX_FAVORITES).collect()
+    }
+
+    pub fn recent_logs(&self) -> &[DiaryEntry] {
+        &self.diary[..self.diary.len().min(RECENT_LOGS)]
+    }
+
+    /// Cartelera: tarjetas con los filtros aplicados.
+    pub fn visible_cards(&self) -> Vec<&MatchCard> {
+        self.filters.apply(&self.cards)
+    }
+
+    /// Watchlist: matches en sala de espera (aplica búsqueda/plataforma/tags pero no el filtro de estado).
+    pub fn watchlist_cards(&self) -> Vec<&MatchCard> {
+        let filters = Filters { status: Some(MatchStatus::Watchlist), ..self.filters.clone() };
+        filters.apply(&self.cards)
+    }
+
+    pub fn cursor(&self) -> usize {
+        self.cursors[self.active_tab.index()]
+    }
+
+    /// Número de elementos navegables en una pestaña.
+    pub fn item_count(&self, tab: Tab) -> usize {
+        match tab {
+            Tab::Dashboard => self.recent_logs().len(),
+            Tab::Cartelera => self.visible_cards().len(),
+            Tab::Watchlist => self.watchlist_cards().len(),
+            Tab::Diary => self.diary.len(),
+            Tab::Lists => self.lists.len(),
+            Tab::Stats => 0,
+        }
+    }
+
+    // ------------------------------------------------------------- navegación
+
+    pub fn set_tab(&mut self, tab: Tab) {
+        self.active_tab = tab;
+        self.clamp_cursor(tab);
+        self.sync_selection();
+    }
+
+    pub fn next_tab(&mut self) {
+        self.set_tab(self.active_tab.next());
+    }
+
+    pub fn prev_tab(&mut self) {
+        self.set_tab(self.active_tab.prev());
+    }
+
+    /// Mueve el cursor de la pestaña activa (negativo = arriba) y actualiza la selección.
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.item_count(self.active_tab);
+        if len == 0 {
+            return;
+        }
+        let i = self.active_tab.index();
+        self.cursors[i] = self.cursors[i].saturating_add_signed(delta).min(len - 1);
+        self.sync_selection();
+    }
+
+    pub fn cursor_to_start(&mut self) {
+        self.cursors[self.active_tab.index()] = 0;
+        self.sync_selection();
+    }
+
+    pub fn cursor_to_end(&mut self) {
+        let len = self.item_count(self.active_tab);
+        self.cursors[self.active_tab.index()] = len.saturating_sub(1);
+        self.sync_selection();
+    }
+
+    /// Coloca el cursor sobre un elemento concreto (p. ej. un clic en la GUI).
+    pub fn set_cursor(&mut self, index: usize) {
+        self.cursors[self.active_tab.index()] = index;
+        self.clamp_cursor(self.active_tab);
+        self.sync_selection();
+    }
+
+    /// Selecciona un match por id y, si es visible en la pestaña activa, mueve el cursor hacia él.
+    pub fn select_match(&mut self, match_id: i64) {
+        self.selected_match = Some(match_id);
+        let pos = match self.active_tab {
+            Tab::Cartelera => self.visible_cards().iter().position(|c| c.profile.id == match_id),
+            Tab::Watchlist => self.watchlist_cards().iter().position(|c| c.profile.id == match_id),
+            _ => None,
+        };
+        if let Some(pos) = pos {
+            self.cursors[self.active_tab.index()] = pos;
+        }
+    }
+
+    /// Llamar tras cambiar `filters` para que el cursor siga siendo válido.
+    pub fn filters_changed(&mut self) {
+        self.clamp_cursor(Tab::Cartelera);
+        self.clamp_cursor(Tab::Watchlist);
+        self.sync_selection();
+    }
+
+    fn clamp_cursor(&mut self, tab: Tab) {
+        let len = self.item_count(tab);
+        let c = &mut self.cursors[tab.index()];
+        *c = (*c).min(len.saturating_sub(1));
+    }
+
+    /// Deriva `selected_*` del cursor de la pestaña activa.
+    fn sync_selection(&mut self) {
+        let c = self.cursor();
+        match self.active_tab {
+            Tab::Cartelera => {
+                if let Some(id) = self.visible_cards().get(c).map(|card| card.profile.id) {
+                    self.selected_match = Some(id);
+                }
+            }
+            Tab::Watchlist => {
+                if let Some(id) = self.watchlist_cards().get(c).map(|card| card.profile.id) {
+                    self.selected_match = Some(id);
+                }
+            }
+            Tab::Dashboard | Tab::Diary => {
+                let entry = if self.active_tab == Tab::Dashboard {
+                    self.recent_logs().get(c)
+                } else {
+                    self.diary.get(c)
+                };
+                if let Some((log_id, match_id)) = entry.map(|e| (e.log.id, e.log.match_id)) {
+                    self.selected_log = Some(log_id);
+                    self.selected_match = Some(match_id);
+                }
+            }
+            Tab::Lists => {
+                if let Some(id) = self.lists.get(c).map(|l| l.id) {
+                    self.selected_list = Some(id);
+                }
+            }
+            Tab::Stats => {}
+        }
+    }
+
+    // ---------------------------------------------------------------- mensajes
+
+    pub fn info(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusMessage { text: text.into(), is_error: false });
+    }
+
+    pub fn error(&mut self, text: impl Into<String>) {
+        self.status = Some(StatusMessage { text: text.into(), is_error: true });
+    }
+
+    pub fn clear_status(&mut self) {
+        self.status = None;
+    }
+
+    // ----------------------------------------------------------------- modales
+
+    pub fn open_new_match(&mut self) {
+        self.modal = Some(Modal::MatchForm(MatchDraft::default()));
+    }
+
+    pub fn open_edit_selected_match(&mut self) {
+        match self.selected_card() {
+            Some(card) => self.modal = Some(Modal::MatchForm(MatchDraft::from_card(card))),
+            None => self.error("Selecciona un match para editarlo"),
+        }
+    }
+
+    /// Nueva reseña para el match seleccionado (o sin match, para elegirlo en el formulario).
+    pub fn open_new_review(&mut self) {
+        let draft = match self.selected_match {
+            Some(id) => ReviewDraft::for_match(id),
+            None => ReviewDraft::default(),
+        };
+        self.modal = Some(Modal::ReviewForm(draft));
+    }
+
+    pub fn open_edit_selected_log(&mut self) {
+        match self.selected_entry() {
+            Some(e) => self.modal = Some(Modal::ReviewForm(ReviewDraft::from_log(&e.log))),
+            None => self.error("Selecciona una entrada del Diary para editarla"),
+        }
+    }
+
+    pub fn open_new_list(&mut self) {
+        self.modal = Some(Modal::ListForm(ListDraft::default()));
+    }
+
+    pub fn open_edit_selected_list(&mut self) {
+        match self.selected_list() {
+            Some(l) => self.modal = Some(Modal::ListForm(ListDraft::from_list(l))),
+            None => self.error("Selecciona una lista para editarla"),
+        }
+    }
+
+    pub fn open_add_to_list(&mut self) {
+        match self.selected_list {
+            Some(list_id) => {
+                self.modal = Some(Modal::ListItemForm(ListItemDraft {
+                    list_id,
+                    match_id: self.selected_match,
+                    note: String::new(),
+                }))
+            }
+            None => self.error("Selecciona una lista primero"),
+        }
+    }
+
+    pub fn open_new_tag(&mut self) {
+        self.modal = Some(Modal::TagForm(TagDraft::default()));
+    }
+
+    /// Pide confirmación para borrar lo seleccionado en la pestaña activa.
+    pub fn open_delete_selected(&mut self) {
+        let target = match self.active_tab {
+            Tab::Dashboard | Tab::Diary => self.selected_log.map(DeleteTarget::Log),
+            Tab::Cartelera | Tab::Watchlist => self.selected_match.map(DeleteTarget::Match),
+            Tab::Lists => self.selected_list.map(DeleteTarget::List),
+            Tab::Stats => None,
+        };
+        match target {
+            Some(t) => self.modal = Some(Modal::ConfirmDelete(t)),
+            None => self.error("No hay nada seleccionado para borrar"),
+        }
+    }
+
+    pub fn open_delete(&mut self, target: DeleteTarget) {
+        self.modal = Some(Modal::ConfirmDelete(target));
+    }
+
+    pub fn close_modal(&mut self) {
+        self.modal = None;
+    }
+
+    /// Texto de confirmación para un borrado.
+    pub fn describe_delete(&self, target: DeleteTarget) -> String {
+        match target {
+            DeleteTarget::Match(id) => format!(
+                "¿Borrar a «{}» y todas sus reseñas?",
+                self.card(id).map(|c| c.profile.alias.as_str()).unwrap_or("?")
+            ),
+            DeleteTarget::Log(id) => match self.log(id) {
+                Some(e) => format!(
+                    "¿Borrar la reseña de «{}» ({}, {})?",
+                    e.match_alias, e.log.interaction_type, e.log.date_logged
+                ),
+                None => "¿Borrar la reseña?".to_string(),
+            },
+            DeleteTarget::List(id) => format!(
+                "¿Borrar la lista «{}»?",
+                self.lists.iter().find(|l| l.id == id).map(|l| l.title.as_str()).unwrap_or("?")
+            ),
+            DeleteTarget::ListItem { match_id, .. } => format!(
+                "¿Quitar a «{}» de la lista?",
+                self.card(match_id).map(|c| c.profile.alias.as_str()).unwrap_or("?")
+            ),
+            DeleteTarget::Tag(id) => format!(
+                "¿Borrar el tag «{}» de todos los matches?",
+                self.tags.iter().find(|t| t.id == id).map(|t| t.name.as_str()).unwrap_or("?")
+            ),
+        }
+    }
+
+    /// Guarda el formulario abierto (o ejecuta el borrado confirmado).
+    ///
+    /// Si la validación falla, el modal sigue abierto y el error queda en `status`.
+    /// Devuelve `Err` sólo ante fallos de la base de datos.
+    pub fn submit_modal(&mut self, db: &Database) -> Result<()> {
+        let Some(modal) = self.modal.take() else { return Ok(()) };
+        match self.apply_modal(db, &modal) {
+            Ok(Ok(msg)) => {
+                self.refresh(db)?;
+                self.info(msg);
+            }
+            Ok(Err(validation)) => {
+                self.error(validation);
+                self.modal = Some(modal);
+            }
+            Err(e) => {
+                self.error(format!("{e:#}"));
+                self.modal = Some(modal);
+            }
+        }
+        Ok(())
+    }
+
+    /// `Ok(Ok(mensaje))` = guardado, `Ok(Err(texto))` = validación, `Err` = BD.
+    fn apply_modal(&mut self, db: &Database, modal: &Modal) -> Result<Result<String, String>> {
+        Ok(Ok(match modal {
+            Modal::MatchForm(draft) => {
+                let profile = match draft.to_profile() {
+                    Ok(p) => p,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let was_favorite = draft.editing_id.and_then(|id| self.card(id)).is_some_and(|c| c.profile.is_favorite);
+                if profile.is_favorite && !was_favorite && self.favorites().len() >= MAX_FAVORITES {
+                    return Ok(Err(format!("El Top {MAX_FAVORITES} está lleno")));
+                }
+                let id = match draft.editing_id {
+                    Some(_) => {
+                        db.update_match(&profile)?;
+                        profile.id
+                    }
+                    None => db.insert_match(&profile)?,
+                };
+                let current: BTreeSet<i64> =
+                    self.card(id).map(|c| c.tags.iter().map(|t| t.id).collect()).unwrap_or_default();
+                for tag_id in draft.tag_ids.difference(&current) {
+                    db.add_tag_to_match(id, *tag_id)?;
+                }
+                for tag_id in current.difference(&draft.tag_ids) {
+                    db.remove_tag_from_match(id, *tag_id)?;
+                }
+                self.selected_match = Some(id);
+                format!("«{}» guardado en la Cartelera", profile.alias)
+            }
+            Modal::ReviewForm(draft) => {
+                let log = match draft.to_log() {
+                    Ok(l) => l,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let id = match draft.editing_id {
+                    Some(_) => {
+                        db.update_log(&log)?;
+                        log.id
+                    }
+                    None => db.insert_log(&log)?,
+                };
+                self.selected_log = Some(id);
+                self.selected_match = Some(log.match_id);
+                format!("Reseña guardada en el Diary: {} {}", log.rating.stars(), log.heart())
+            }
+            Modal::ListForm(draft) => {
+                let list = match draft.to_list() {
+                    Ok(l) => l,
+                    Err(e) => return Ok(Err(e)),
+                };
+                let id = match draft.editing_id {
+                    Some(_) => {
+                        db.update_list(&list)?;
+                        list.id
+                    }
+                    None => db.create_list(&list)?,
+                };
+                self.selected_list = Some(id);
+                format!("Lista «{}» guardada", list.title)
+            }
+            Modal::ListItemForm(draft) => {
+                let Some(match_id) = draft.match_id else {
+                    return Ok(Err("Elige un match para añadir a la lista".to_string()));
+                };
+                let note = non_empty(&draft.note);
+                db.add_list_item(draft.list_id, match_id, note.as_deref())?;
+                "Match añadido a la lista".to_string()
+            }
+            Modal::TagForm(draft) => {
+                let Some(name) = non_empty(&draft.name) else {
+                    return Ok(Err("El tag necesita un nombre".to_string()));
+                };
+                if self.tags.iter().any(|t| t.name.eq_ignore_ascii_case(&name)) {
+                    return Ok(Err(format!("El tag «{name}» ya existe")));
+                }
+                db.create_tag(&name, draft.category)?;
+                format!("Tag {} {name} creado", draft.category.emoji())
+            }
+            Modal::ConfirmDelete(target) => {
+                let msg = self.describe_delete(*target);
+                match *target {
+                    DeleteTarget::Match(id) => db.delete_match(id)?,
+                    DeleteTarget::Log(id) => db.delete_log(id)?,
+                    DeleteTarget::List(id) => db.delete_list(id)?,
+                    DeleteTarget::ListItem { list_id, match_id } => {
+                        db.remove_list_item(list_id, match_id)?
+                    }
+                    DeleteTarget::Tag(id) => db.delete_tag(id)?,
+                }
+                format!("Hecho: {}", msg.trim_start_matches('¿').trim_end_matches('?'))
+            }
+        }))
+    }
+
+    // --------------------------------------------------------- acciones rápidas
+
+    /// Alterna el favorito (Top 4) del match seleccionado.
+    pub fn toggle_favorite_selected(&mut self, db: &Database) -> Result<()> {
+        let Some(card) = self.selected_card() else {
+            self.error("Selecciona un match");
+            return Ok(());
+        };
+        let (id, fav, alias) = (card.profile.id, !card.profile.is_favorite, card.profile.alias.clone());
+        match db.set_favorite(id, fav) {
+            Ok(()) => {
+                self.refresh(db)?;
+                self.info(if fav {
+                    format!("«{alias}» entra al Top 4")
+                } else {
+                    format!("«{alias}» sale del Top 4")
+                });
+            }
+            Err(e) => self.error(format!("{e:#}")),
+        }
+        Ok(())
+    }
+
+    /// Avanza el estado del match seleccionado al siguiente (cíclico).
+    pub fn cycle_status_selected(&mut self, db: &Database) -> Result<()> {
+        let Some(card) = self.selected_card() else {
+            self.error("Selecciona un match");
+            return Ok(());
+        };
+        let (id, next) = (card.profile.id, card.profile.status.next());
+        db.set_status(id, next)?;
+        self.refresh(db)?;
+        self.info(format!("Nuevo estado: {next}"));
+        Ok(())
+    }
+
+    /// Mueve el item del match seleccionado dentro de la lista seleccionada.
+    pub fn move_list_item(&mut self, db: &Database, match_id: i64, up: bool) -> Result<()> {
+        let Some(list_id) = self.selected_list else { return Ok(()) };
+        db.move_list_item(list_id, match_id, up)?;
+        self.refresh(db)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> (Database, AppState) {
+        let db = Database::open_in_memory().unwrap();
+        db.seed_if_empty().unwrap();
+        let st = AppState::load(&db).unwrap();
+        (db, st)
+    }
+
+    #[test]
+    fn navigation_updates_selection() {
+        let (_db, mut st) = state();
+        st.set_tab(Tab::Cartelera);
+        let first = st.selected_match;
+        assert!(first.is_some());
+        st.move_cursor(1);
+        assert_ne!(st.selected_match, first);
+        st.move_cursor(100);
+        assert_eq!(st.cursor(), st.item_count(Tab::Cartelera) - 1);
+        st.set_tab(Tab::Watchlist);
+        assert_eq!(st.watchlist_cards().len(), 1);
+        assert_eq!(st.selected_card().unwrap().profile.status, MatchStatus::Watchlist);
+    }
+
+    #[test]
+    fn filters_work() {
+        let (_db, mut st) = state();
+        st.filters.search = "pez".into(); // coincide por tag
+        assert_eq!(st.visible_cards().len(), 1);
+        st.filters.clear();
+        st.filters.only_favorites = true;
+        assert_eq!(st.visible_cards().len(), 2);
+        st.filters.clear();
+        st.filters.sort = SortBy::Rating;
+        assert!(st.visible_cards()[0].profile.alias.contains("perro"));
+    }
+
+    #[test]
+    fn review_form_validation_and_save() {
+        let (db, mut st) = state();
+        st.set_tab(Tab::Watchlist);
+        st.open_new_review();
+        if let Some(Modal::ReviewForm(d)) = &mut st.modal {
+            d.date_logged = "ayer".into();
+        }
+        st.submit_modal(&db).unwrap();
+        assert!(st.modal.is_some(), "la validación debe mantener el modal abierto");
+        assert!(st.status.as_ref().unwrap().is_error);
+
+        if let Some(Modal::ReviewForm(d)) = &mut st.modal {
+            d.date_logged = "2026-10-16".into();
+            d.interaction_type = InteractionType::PrimeraCita;
+            d.adjust_rating(4);
+            d.adjust_score(SubScore::Direction, 1);
+            d.liked = true;
+        }
+        st.submit_modal(&db).unwrap();
+        assert!(st.modal.is_none());
+        assert_eq!(st.diary.len(), 8);
+        assert_eq!(st.selected_entry().unwrap().log.rating.value(), 10);
+    }
+
+    #[test]
+    fn match_form_creates_with_tags_and_delete() {
+        let (db, mut st) = state();
+        st.open_new_match();
+        let tag_id = st.tags[0].id;
+        if let Some(Modal::MatchForm(d)) = &mut st.modal {
+            d.alias = "El DJ de bodas que se cree Avicii".into();
+            d.age = "34".into();
+            d.platform = Platform::Irl;
+            d.toggle_tag(tag_id);
+        }
+        st.submit_modal(&db).unwrap();
+        let card = st.selected_card().unwrap();
+        assert_eq!(card.profile.alias, "El DJ de bodas que se cree Avicii");
+        assert_eq!(card.tags.len(), 1);
+
+        let id = card.profile.id;
+        st.open_delete(DeleteTarget::Match(id));
+        st.submit_modal(&db).unwrap();
+        assert!(st.card(id).is_none());
+    }
+}
