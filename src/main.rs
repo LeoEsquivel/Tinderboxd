@@ -1,7 +1,8 @@
-// Fase 1: buena parte de la API de `core` la consumirán `tui/` y `gui/` en las
-// fases 2 y 3; hasta entonces silenciamos los avisos de código sin usar.
+// Parte de la API pública de `core` (CRUD de lectura, selección por clic, etc.)
+// la consumirán `gui/` (Fase 3) y `export.rs` (Fase 4).
 #[allow(dead_code)]
 mod core;
+mod tui;
 
 use std::path::PathBuf;
 
@@ -16,13 +17,17 @@ use crate::core::state::AppState;
 #[derive(Parser, Debug)]
 #[command(name = "tinderboxd", version, about)]
 struct Cli {
-    /// Lanza la interfaz de terminal (ratatui).
-    #[arg(long, conflicts_with = "gui")]
+    /// Lanza la interfaz de terminal (ratatui). Es la opción por defecto.
+    #[arg(long, conflicts_with_all = ["gui", "resumen"])]
     tui: bool,
 
     /// Lanza la interfaz de escritorio (egui).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "resumen")]
     gui: bool,
+
+    /// Imprime en consola un resumen de los datos y las estadísticas, y termina.
+    #[arg(long)]
+    resumen: bool,
 
     /// Ruta del archivo SQLite.
     #[arg(long, default_value = DEFAULT_DB_PATH)]
@@ -33,31 +38,32 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let db = Database::open(&cli.db)?;
-    if db.seed_if_empty()? {
-        println!("🌱 Base de datos nueva: datos de ejemplo insertados en {}", cli.db.display());
-    }
-    let state = AppState::load(&db)?;
+    let seeded = db.seed_if_empty()?;
 
-    print_summary(&state);
-
-    if cli.tui {
-        println!("\n(--tui) La interfaz de terminal llega en la Fase 2.");
+    if cli.resumen {
+        if seeded {
+            println!("🌱 Base de datos nueva: datos de ejemplo insertados en {}", cli.db.display());
+        }
+        print_summary(&AppState::load(&db)?);
+        Ok(())
     } else if cli.gui {
-        println!("\n(--gui) La interfaz de escritorio llega en la Fase 3.");
+        println!("La interfaz de escritorio (--gui) llega en la Fase 3. Usa --tui por ahora.");
+        Ok(())
+    } else {
+        tui::run(db)
     }
-    Ok(())
 }
 
-/// Volcado de verificación de la capa `core` (temporal, Fase 1).
+/// Volcado de los datos en consola (`--resumen`).
 fn print_summary(state: &AppState) {
-    println!("\n══════════════ TINDERBOXD · resumen de la Fase 1 ══════════════");
+    println!("\n══════════════ TINDERBOXD · resumen ══════════════");
 
     println!("\n★ TOP 4 FAVORITOS");
     for card in state.favorites() {
         println!("  ♥ {}  {}", card.profile.headline(), card.avg_stars());
     }
 
-    println!("\n🎬 CARTELERA ({} matches)", state.cards.len());
+    println!("\n💘 MATCHES ({})", state.cards.len());
     for card in &state.cards {
         let p = &card.profile;
         println!(

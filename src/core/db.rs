@@ -181,9 +181,9 @@ fn validate_sub_score(name: &str, score: Option<u8>) -> Result<()> {
 }
 
 fn validate_log(log: &InteractionLog) -> Result<()> {
-    validate_sub_score("Guion", log.script_score)?;
-    validate_sub_score("Fotografía", log.cinematography_score)?;
-    validate_sub_score("Dirección", log.direction_score)
+    validate_sub_score("Conversación", log.script_score)?;
+    validate_sub_score("Fotos vs. realidad", log.cinematography_score)?;
+    validate_sub_score("Química", log.direction_score)
 }
 
 fn pct(part: u32, total: u32) -> Option<f64> {
@@ -327,7 +327,7 @@ impl Database {
         Ok(())
     }
 
-    /// Pósters de la Cartelera con agregados y tags, ordenados por fecha de match.
+    /// Tarjetas de matches con agregados y tags, ordenadas por fecha de match.
     pub fn match_cards(&self) -> Result<Vec<MatchCard>> {
         let sql = format!(
             "SELECT {MATCH_COLS},
@@ -814,8 +814,8 @@ const SEED: &[SeedMatch] = &[
                 scores: (4, 4, 4),
                 liked: true,
                 spoilers: false,
-                review: "Abrió con un meme de un gran danés en una silla de oficina. Diálogos ágiles, \
-                         timing de comedia impecable. Prometedor primer acto.",
+                review: "Abrió con un meme de un gran danés en una silla de oficina. Respuestas \
+                         rápidas, humor afinado y cero '¿hola, cómo estás?'. Muy buena señal.",
             },
             SeedLog {
                 kind: InteractionType::Llamada,
@@ -824,8 +824,8 @@ const SEED: &[SeedMatch] = &[
                 scores: (4, 3, 4),
                 liked: false,
                 spoilers: false,
-                review: "40 minutos de llamada, 15 de ellos ladridos de fondo. El sonido directo \
-                         necesita trabajo, pero la química aguanta.",
+                review: "40 minutos de llamada, 15 de ellos con ladridos de fondo. Se oía fatal, \
+                         pero la plática fluyó sola.",
             },
             SeedLog {
                 kind: InteractionType::PrimeraCita,
@@ -835,8 +835,8 @@ const SEED: &[SeedMatch] = &[
                 liked: true,
                 spoilers: true,
                 review: "Llevó a Bruno al parque. Bruno me tiró al lodo en el minuto 3 y ella se rió \
-                         tanto que le salió agua de coco por la nariz. Giro de guion: Bruno me aprobó. \
-                         Obra maestra del cine independiente.",
+                         tanto que le salió agua de coco por la nariz. Lo importante: Bruno me aprobó. \
+                         Ya hay segunda cita agendada.",
             },
         ],
     },
@@ -862,8 +862,8 @@ const SEED: &[SeedMatch] = &[
                 scores: (4, 4, 3),
                 liked: true,
                 spoilers: false,
-                review: "Mandó una playlist de son jarocho con jazz. Tráiler espectacular; \
-                         el marketing de esta producción es de primer nivel.",
+                review: "Mandó una playlist de son jarocho con jazz. Buen gusto, buena ortografía \
+                         y preguntas interesantes. Prometía muchísimo.",
             },
             SeedLog {
                 kind: InteractionType::PrimeraCita,
@@ -872,9 +872,9 @@ const SEED: &[SeedMatch] = &[
                 scores: (2, 4, 1),
                 liked: false,
                 spoilers: true,
-                review: "Llegó puntual, eso sí. Luego: monólogo de dos horas sobre el agave, sin \
-                         intermedio. Pidió seis catas y propuso pagar a la mitad. No volvió a escribir. \
-                         Un documental de Discovery Channel que nadie pidió.",
+                review: "Llegó puntual, eso sí. Luego: dos horas de clase sobre el agave sin dejarme \
+                         hablar. Pidió seis catas y propuso pagar a la mitad. No volvió a escribir. \
+                         Sus fotos eran reales; su interés en mí, no.",
             },
         ],
     },
@@ -900,7 +900,7 @@ const SEED: &[SeedMatch] = &[
             liked: false,
             spoilers: false,
             review: "Me ofreció invertir en su memecoin ($BROCOIN) antes de preguntarme el nombre. \
-                     La foto con el pez era, de hecho, un NFT del pez. Unmatch en el segundo acto.",
+                     La foto con el pez era, de hecho, un NFT del pez. Unmatch a los diez mensajes.",
         }],
     },
     SeedMatch {
@@ -925,8 +925,8 @@ const SEED: &[SeedMatch] = &[
             liked: true,
             spoilers: false,
             review: "Me pidió mi hora exacta de nacimiento antes que mi nombre. Hizo mi carta astral \
-                     y concluyó que 'tenemos potencial pero mi Venus da miedo'. Estreno de la primera \
-                     cita pendiente: depende de Mercurio.",
+                     y concluyó que 'tenemos potencial pero mi Venus da miedo'. La primera cita queda \
+                     pendiente hasta que Mercurio deje de estar retrógrado.",
         }],
     },
 ];
@@ -974,17 +974,17 @@ fn seed(db: &Database) -> Result<()> {
 
     let list_id = db.create_list(&CustomList {
         id: 0,
-        title: "Cine de terror: edición apps de ligue".to_string(),
+        title: "Citas que debieron quedarse en el chat".to_string(),
         description: Some(
-            "Ranking de las citas que debieron quedarse en tráiler. Ver con las luces encendidas."
+            "Ranking de mis peores experiencias en apps. Leer con precaución y poca fe en el amor."
                 .to_string(),
         ),
         is_ranked: true,
     })?;
     for (alias, note) in [
-        ("Crypto Bro de Polanco", "Found footage financiero. Te persigue con un pitch deck."),
-        ("El sommelier de mezcal", "Slow cinema: 120 minutos de plano fijo hablando de agave."),
-        ("La astróloga de la Roma Norte", "Thriller psicológico. Mercurio sigue en retrógrado."),
+        ("Crypto Bro de Polanco", "Me mandó su pitch deck en lugar de su Instagram."),
+        ("El sommelier de mezcal", "Dos horas de monólogo sobre agave y aun así pagamos a la mitad."),
+        ("La astróloga de la Roma Norte", "Sigo sin cita: Mercurio continúa retrógrado."),
     ] {
         db.add_list_item(list_id, match_ids[alias], Some(note))?;
     }

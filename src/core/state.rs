@@ -35,7 +35,7 @@ impl Tab {
     pub fn title(&self) -> &'static str {
         match self {
             Tab::Dashboard => "Perfil",
-            Tab::Cartelera => "Cartelera",
+            Tab::Cartelera => "Matches",
             Tab::Watchlist => "Watchlist",
             Tab::Diary => "Diary",
             Tab::Lists => "Listas",
@@ -285,9 +285,9 @@ impl SubScore {
 
     pub fn label(&self) -> &'static str {
         match self {
-            SubScore::Script => "Guion (conversación)",
-            SubScore::Cinematography => "Fotografía (fidelidad a sus fotos)",
-            SubScore::Direction => "Dirección (química e iniciativa)",
+            SubScore::Script => "Conversación",
+            SubScore::Cinematography => "Fotos vs. realidad",
+            SubScore::Direction => "Química e iniciativa",
         }
     }
 }
@@ -934,7 +934,7 @@ impl AppState {
                     db.remove_tag_from_match(id, *tag_id)?;
                 }
                 self.selected_match = Some(id);
-                format!("«{}» guardado en la Cartelera", profile.alias)
+                format!("«{}» guardado en tus matches", profile.alias)
             }
             Modal::ReviewForm(draft) => {
                 let log = match draft.to_log() {

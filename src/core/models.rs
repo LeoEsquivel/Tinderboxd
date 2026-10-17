@@ -117,13 +117,6 @@ text_enum!(MatchStatus, "estado", {
     SoloAmigos => "Solo Amigos",
 });
 
-impl MatchStatus {
-    /// Estados que cuentan como "ghosting" en el embudo de supervivencia.
-    pub fn is_ghosting(&self) -> bool {
-        matches!(self, MatchStatus::Ghosteado | MatchStatus::GhostingMutuo)
-    }
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum InteractionType {
     Chat,
@@ -140,18 +133,6 @@ text_enum!(InteractionType, "tipo de interacción", {
     PrimeraCita => "Primera Cita",
     CitaCasual => "Cita Casual",
 });
-
-impl InteractionType {
-    /// Etapa del embudo (1 = Chat ... 4 = Cita Casual).
-    pub fn funnel_stage(&self) -> u8 {
-        match self {
-            InteractionType::Chat => 1,
-            InteractionType::Llamada => 2,
-            InteractionType::PrimeraCita => 3,
-            InteractionType::CitaCasual => 4,
-        }
-    }
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum TagCategory {
@@ -271,7 +252,7 @@ pub fn format_score_dots(score: u8) -> String {
 // Entidades (tablas)
 // ---------------------------------------------------------------------------
 
-/// Tabla `matches`: el equivalente a una película.
+/// Tabla `matches`: cada persona con la que hiciste match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchProfile {
     pub id: i64,
@@ -301,7 +282,7 @@ impl MatchProfile {
         }
     }
 
-    /// Línea corta tipo "título (año)": `La chica del perro gigante (27) · Tinder`.
+    /// Línea corta de presentación: `La chica del perro gigante (27) · Tinder`.
     pub fn headline(&self) -> String {
         match self.age {
             Some(age) => format!("{} ({}) · {}", self.alias, age, self.platform),
@@ -318,11 +299,11 @@ pub struct InteractionLog {
     pub interaction_type: InteractionType,
     pub date_logged: NaiveDate,
     pub rating: Rating,
-    /// Guion / conversación (1..=5).
+    /// Conversación (1..=5).
     pub script_score: Option<u8>,
-    /// Fotografía / fidelidad a sus fotos (1..=5).
+    /// Fotos vs. realidad (1..=5).
     pub cinematography_score: Option<u8>,
-    /// Dirección / química e iniciativa (1..=5).
+    /// Química e iniciativa (1..=5).
     pub direction_score: Option<u8>,
     pub liked: bool,
     pub review_text: Option<String>,
@@ -334,12 +315,12 @@ impl InteractionLog {
         if self.liked { "♥" } else { "" }
     }
 
-    /// Resumen de sub-métricas: `Guion ●●●●○ · Fotografía ●●●○○ · Dirección ●●○○○`.
+    /// Resumen de sub-métricas: `Conversación ●●●●○ · Fotos vs. realidad ●●●○○ · Química ●●○○○`.
     pub fn sub_scores_line(&self) -> String {
         [
-            ("Guion", self.script_score),
-            ("Fotografía", self.cinematography_score),
-            ("Dirección", self.direction_score),
+            ("Conversación", self.script_score),
+            ("Fotos vs. realidad", self.cinematography_score),
+            ("Química", self.direction_score),
         ]
         .iter()
         .filter_map(|(label, s)| s.map(|v| format!("{label} {}", format_score_dots(v))))
@@ -384,7 +365,7 @@ pub struct ListItem {
 // Vistas agregadas (lo que consumen los frontends)
 // ---------------------------------------------------------------------------
 
-/// Póster de la Cartelera: perfil + agregados de sus logs + tags.
+/// Tarjeta de un match (vista Cartelera/Matches): perfil + agregados de sus logs + tags.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchCard {
     pub profile: MatchProfile,
