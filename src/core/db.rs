@@ -1,10 +1,12 @@
 //! Capa SQLite de Tinderboxd: esquema (Punto 4), CRUD, estadísticas (Punto 5) y semilla.
 
 use std::collections::HashMap;
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 
-use anyhow::{Context, Result, bail};
-use chrono::NaiveDate;
+use anyhow::{Context, Result, anyhow, bail};
+use chrono::{Local, NaiveDate};
 use rusqlite::types::{FromSql, FromSqlError, FromSqlResult, ToSqlOutput, ValueRef};
 use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 
@@ -15,6 +17,12 @@ pub const DEFAULT_DB_PATH: &str = "tinderboxd.db";
 
 /// Tamaño máximo del "Top 4" del perfil.
 pub const MAX_FAVORITES: usize = 4;
+
+/// Carpeta (junto a la base de datos) donde se copian las fotos de los matches.
+pub const PHOTOS_DIR: &str = "tinderboxd_fotos";
+
+/// Extensiones de imagen aceptadas para las fotos.
+pub const PHOTO_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
 const SCHEMA_VERSION: i64 = 1;
 
@@ -196,6 +204,8 @@ fn pct(part: u32, total: u32) -> Option<f64> {
 
 pub struct Database {
     conn: Connection,
+    /// Carpeta de fotos gestionadas por la app.
+    photos_dir: PathBuf,
 }
 
 impl Database {
@@ -204,19 +214,84 @@ impl Database {
         let path = path.as_ref();
         let conn = Connection::open(path)
             .with_context(|| format!("no se pudo abrir la base de datos {}", path.display()))?;
-        Self::from_connection(conn)
+        let base = std::path::absolute(path)?.parent().map(Path::to_path_buf).unwrap_or_default();
+        Self::from_connection(conn, base.join(PHOTOS_DIR))
     }
 
     /// Base de datos efímera (tests, previsualizaciones de import).
     pub fn open_in_memory() -> Result<Self> {
-        Self::from_connection(Connection::open_in_memory()?)
+        let photos = std::env::temp_dir().join(format!("{PHOTOS_DIR}_{}", std::process::id()));
+        Self::from_connection(Connection::open_in_memory()?, photos)
     }
 
-    fn from_connection(conn: Connection) -> Result<Self> {
+    fn from_connection(conn: Connection, photos_dir: PathBuf) -> Result<Self> {
         conn.execute_batch("PRAGMA foreign_keys = ON;")?;
-        let db = Database { conn };
+        let db = Database { conn, photos_dir };
         db.migrate()?;
         Ok(db)
+    }
+
+    // ------------------------------------------------------------------- fotos
+    //
+    // En SQLite las fotos gestionadas se guardan como nombre de archivo relativo a
+    // `photos_dir`; hacia fuera `MatchProfile::avatar_path` siempre es absoluta.
+
+    pub fn photos_dir(&self) -> &Path {
+        &self.photos_dir
+    }
+
+    /// `true` si la ruta apunta a una foto ya copiada en la carpeta de la app.
+    pub fn is_managed_photo(&self, path: &str) -> bool {
+        Path::new(path).starts_with(&self.photos_dir)
+    }
+
+    /// Copia una imagen a la carpeta de fotos y devuelve su nueva ruta absoluta.
+    pub fn import_photo(&self, src: &Path) -> Result<String> {
+        if !src.is_file() {
+            bail!("No encuentro la imagen {}", src.display());
+        }
+        let ext = src
+            .extension()
+            .and_then(|e| e.to_str())
+            .map(str::to_lowercase)
+            .filter(|e| PHOTO_EXTENSIONS.contains(&e.as_str()))
+            .ok_or_else(|| anyhow!("Formato de imagen no soportado: usa PNG, JPG o WEBP"))?;
+        fs::create_dir_all(&self.photos_dir)
+            .with_context(|| format!("no se pudo crear {}", self.photos_dir.display()))?;
+
+        static SEQ: AtomicU64 = AtomicU64::new(0);
+        let name = format!(
+            "{}-{}.{ext}",
+            Local::now().format("%Y%m%d-%H%M%S%3f"),
+            SEQ.fetch_add(1, Ordering::Relaxed)
+        );
+        let dest = self.photos_dir.join(name);
+        fs::copy(src, &dest).with_context(|| format!("no se pudo copiar {}", src.display()))?;
+        Ok(dest.to_string_lossy().into_owned())
+    }
+
+    /// Borra una foto gestionada (las rutas externas nunca se tocan).
+    pub fn remove_photo(&self, path: &str) {
+        if self.is_managed_photo(path) {
+            let _ = fs::remove_file(path);
+        }
+    }
+
+    /// Ruta absoluta → valor a guardar en la BD.
+    fn stored_photo(&self, path: &Option<String>) -> Option<String> {
+        path.as_ref().map(|p| match Path::new(p).strip_prefix(&self.photos_dir) {
+            Ok(rel) => rel.to_string_lossy().into_owned(),
+            Err(_) => p.clone(),
+        })
+    }
+
+    /// Lee un `MatchProfile` resolviendo la foto a ruta absoluta.
+    fn match_row(&self, row: &Row<'_>, o: usize) -> rusqlite::Result<MatchProfile> {
+        let mut p = match_from_row(row, o)?;
+        p.avatar_path = p.avatar_path.map(|s| {
+            if Path::new(&s).is_relative() { self.photos_dir.join(s).to_string_lossy().into_owned() } else { s }
+        });
+        Ok(p)
     }
 
     fn migrate(&self) -> Result<()> {
@@ -235,7 +310,13 @@ impl Database {
             "INSERT INTO matches (alias, age, platform, bio_highlight, avatar_path, match_date, status, is_favorite)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
-                m.alias, m.age, m.platform, m.bio_highlight, m.avatar_path, m.match_date, m.status,
+                m.alias,
+                m.age,
+                m.platform,
+                m.bio_highlight,
+                self.stored_photo(&m.avatar_path),
+                m.match_date,
+                m.status,
                 m.is_favorite
             ],
         )?;
@@ -248,8 +329,15 @@ impl Database {
                     match_date = ?7, status = ?8, is_favorite = ?9
              WHERE id = ?1",
             params![
-                m.id, m.alias, m.age, m.platform, m.bio_highlight, m.avatar_path, m.match_date,
-                m.status, m.is_favorite
+                m.id,
+                m.alias,
+                m.age,
+                m.platform,
+                m.bio_highlight,
+                self.stored_photo(&m.avatar_path),
+                m.match_date,
+                m.status,
+                m.is_favorite
             ],
         )?;
         if n == 0 {
@@ -266,7 +354,7 @@ impl Database {
 
     pub fn get_match(&self, id: i64) -> Result<Option<MatchProfile>> {
         let sql = format!("SELECT {MATCH_COLS} FROM matches m WHERE m.id = ?1");
-        Ok(self.conn.query_row(&sql, [id], |r| match_from_row(r, 0)).optional()?)
+        Ok(self.conn.query_row(&sql, [id], |r| self.match_row(r, 0)).optional()?)
     }
 
     /// Todos los matches, los más recientes primero.
@@ -275,7 +363,7 @@ impl Database {
             "SELECT {MATCH_COLS} FROM matches m ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| match_from_row(r, 0))?;
+        let rows = stmt.query_map([], |r| self.match_row(r, 0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -285,7 +373,7 @@ impl Database {
              ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([status], |r| match_from_row(r, 0))?;
+        let rows = stmt.query_map([status], |r| self.match_row(r, 0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -295,7 +383,7 @@ impl Database {
             "SELECT {MATCH_COLS} FROM matches m WHERE m.is_favorite = 1 ORDER BY m.id LIMIT {MAX_FAVORITES}"
         );
         let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([], |r| match_from_row(r, 0))?;
+        let rows = stmt.query_map([], |r| self.match_row(r, 0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
@@ -346,7 +434,7 @@ impl Database {
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| {
             Ok(MatchCard {
-                profile: match_from_row(r, 0)?,
+                profile: self.match_row(r, 0)?,
                 log_count: r.get(9)?,
                 avg_rating: r.get(10)?,
                 liked: r.get(11)?,
@@ -581,7 +669,7 @@ impl Database {
                     rank_order: r.get(2)?,
                     item_note: r.get(3)?,
                 },
-                profile: match_from_row(r, 4)?,
+                profile: self.match_row(r, 4)?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
@@ -1043,6 +1131,36 @@ mod tests {
         db.delete_match(id).unwrap();
         assert!(db.get_match(id).unwrap().is_none());
         assert!(db.get_log(log_id).unwrap().is_none(), "los logs deben borrarse en cascada");
+    }
+
+    #[test]
+    fn photos_are_copied_stored_relative_and_removed() {
+        let db = seeded();
+        let src = std::env::temp_dir().join(format!("tinderboxd_test_src_{}.png", std::process::id()));
+        fs::write(&src, b"no es un png real, pero sirve para copiar").unwrap();
+
+        let imported = db.import_photo(&src).unwrap();
+        assert!(db.is_managed_photo(&imported));
+        assert!(Path::new(&imported).is_file());
+
+        let mut m = MatchProfile::new("Con foto", Platform::Tinder, MatchStatus::Activa);
+        m.avatar_path = Some(imported.clone());
+        let id = db.insert_match(&m).unwrap();
+        let raw: String =
+            db.conn.query_row("SELECT avatar_path FROM matches WHERE id = ?1", [id], |r| r.get(0)).unwrap();
+        assert!(Path::new(&raw).is_relative(), "en la BD se guarda relativa: {raw}");
+        assert_eq!(db.get_match(id).unwrap().unwrap().avatar_path.as_deref(), Some(imported.as_str()));
+
+        db.remove_photo(&imported);
+        assert!(!Path::new(&imported).exists());
+        db.remove_photo(src.to_str().unwrap()); // externa: no se toca
+        assert!(src.exists());
+        let _ = fs::remove_file(&src);
+
+        let bad = std::env::temp_dir().join("tinderboxd_test.gif");
+        fs::write(&bad, b"gif").unwrap();
+        assert!(db.import_photo(&bad).is_err());
+        let _ = fs::remove_file(&bad);
     }
 
     #[test]

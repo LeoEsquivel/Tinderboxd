@@ -9,7 +9,7 @@ use eframe::egui::{
     pos2, vec2,
 };
 
-use crate::core::db::MAX_FAVORITES;
+use crate::core::db::{MAX_FAVORITES, PHOTO_EXTENSIONS};
 use crate::core::models::{
     DiaryEntry, InteractionLog, MatchCard, MatchProfile, MatchStatus, Platform, StatsSummary, Tag,
     TagCategory, format_stars,
@@ -59,9 +59,13 @@ fn install_symbol_font(ctx: &egui::Context) {
     let windows = std::env::var("WINDIR").map(|w| format!(r"{w}\Fonts\seguisym.ttf")).unwrap_or_default();
     let candidates = [
         windows.as_str(),
+        // macOS
         "/System/Library/Fonts/Apple Symbols.ttf",
+        // Linux: Debian/Ubuntu, Arch, Fedora, openSUSE
         "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
         "/usr/share/fonts/TTF/DejaVuSans.ttf",
+        "/usr/share/fonts/dejavu-sans-fonts/DejaVuSans.ttf",
+        "/usr/share/fonts/truetype/DejaVuSans.ttf",
     ];
     let Some(bytes) = candidates.iter().filter(|p| !p.is_empty()).find_map(|p| std::fs::read(p).ok()) else {
         return;
@@ -254,6 +258,19 @@ fn cover_uv(image: Vec2, target: Vec2) -> Rect {
     }
 }
 
+/// URI `file:///…` para el cargador de imágenes. En Windows `file://C:\…` se
+/// interpretaría como ruta de red (UNC), así que se normaliza a `file:///C:/…`.
+/// En Linux/macOS `\` es un carácter válido en nombres de archivo y no se toca.
+fn file_uri(path: &str) -> String {
+    let path = if cfg!(windows) { path.replace('\\', "/") } else { path.to_string() };
+    if path.starts_with('/') { format!("file://{path}") } else { format!("file:///{path}") }
+}
+
+/// Tecla modificadora tal como la nombra cada sistema (egui mapea COMMAND a ⌘ en macOS).
+fn mod_key() -> &'static str {
+    if cfg!(target_os = "macos") { "Cmd" } else { "Ctrl" }
+}
+
 /// Póster: la foto del match si existe; si no, un póster generado con sus iniciales.
 fn paint_poster(ui: &Ui, rect: Rect, p: &MatchProfile) {
     let radius = CornerRadius::same(4);
@@ -261,7 +278,7 @@ fn paint_poster(ui: &Ui, rect: Rect, p: &MatchProfile) {
 
     let mut painted = false;
     if let Some(path) = p.avatar_path.as_deref().filter(|path| Path::new(path).exists()) {
-        let image = egui::Image::new(format!("file://{path}"));
+        let image = egui::Image::new(file_uri(path));
         if let Ok(egui::load::TexturePoll::Ready { texture }) = image.load_for_size(ui.ctx(), rect.size()) {
             image.uv(cover_uv(texture.size, rect.size())).corner_radius(radius).paint_at(ui, rect);
             painted = true;
@@ -310,8 +327,9 @@ fn poster_tile(ui: &mut Ui, card: &MatchCard, selected: bool) -> Response {
     } else {
         None
     };
+    // Por dentro: por fuera, el ScrollArea recorta el marco de la fila superior.
     if let Some(stroke) = stroke {
-        painter.rect_stroke(poster, CornerRadius::same(4), stroke, StrokeKind::Outside);
+        painter.rect_stroke(poster, CornerRadius::same(4), stroke, StrokeKind::Inside);
     }
 
     let caption = ui.painter_at(rect);
@@ -414,13 +432,22 @@ fn form_label(ui: &mut Ui, text: &str) {
 // ---------------------------------------------------------------------------
 
 pub fn header(ui: &mut Ui, app: &mut GuiApp) {
+    // Algunos gestores de ventanas ignoran el tamaño mínimo: compactar antes de solapar.
+    let width = ui.available_width();
+    let show_wordmark = width >= 1000.0;
+    let compact_actions = width < 840.0;
+
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(44.0, 22.0), Sense::hover());
         for (i, color) in [ORANGE, GREEN, BLUE].into_iter().enumerate() {
             ui.painter().circle_filled(pos2(rect.left() + 8.0 + i as f32 * 13.0, rect.center().y), 7.5, color);
         }
-        ui.label(RichText::new("TINDERBOXD").size(20.0).strong().color(BRIGHT));
-        ui.add_space(24.0);
+        if show_wordmark {
+            ui.label(RichText::new("TINDERBOXD").size(20.0).strong().color(BRIGHT));
+            ui.add_space(24.0);
+        } else {
+            ui.add_space(8.0);
+        }
 
         for tab in Tab::ALL {
             let active = app.state.active_tab == tab;
@@ -432,17 +459,31 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
                 .fill(if active { INPUT } else { Color32::TRANSPARENT })
                 .stroke(if active { Stroke::new(1.0, GREEN) } else { Stroke::NONE })
                 .corner_radius(CornerRadius::same(4));
-            let shortcut = format!("Ctrl+{}", tab.index() + 1);
+            let shortcut = format!("{}+{}", mod_key(), tab.index() + 1);
             if ui.add(button).on_hover_text(shortcut).clicked() {
                 app.state.set_tab(tab);
             }
         }
 
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            if ui.add(primary_button("+ Registrar")).on_hover_text("Ctrl+R").clicked() {
+            if compact_actions {
+                ui.menu_button(RichText::new("+ Nuevo").strong().color(GREEN), |ui| {
+                    if ui.button(format!("Registrar interacción  ({}+R)", mod_key())).clicked() {
+                        app.state.open_new_review();
+                    }
+                    if ui.button(format!("Match  ({}+N)", mod_key())).clicked() {
+                        app.state.open_new_match();
+                    }
+                    if ui.button("Flag").clicked() {
+                        app.state.open_new_tag();
+                    }
+                });
+                return;
+            }
+            if ui.add(primary_button("+ Registrar")).on_hover_text(format!("{}+R", mod_key())).clicked() {
                 app.state.open_new_review();
             }
-            if ui.add(secondary_button("+ Match")).on_hover_text("Ctrl+N").clicked() {
+            if ui.add(secondary_button("+ Match")).on_hover_text(format!("{}+N", mod_key())).clicked() {
                 app.state.open_new_match();
             }
             if ui.add(secondary_button("+ Flag")).clicked() {
@@ -473,7 +514,10 @@ pub fn status_bar(ui: &mut Ui, app: &mut GuiApp) {
             }
         }
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-            ui.label(RichText::new("Ctrl+N nuevo match · Ctrl+R registrar · Esc cierra ventanas").small().color(DIM));
+            let m = mod_key();
+            ui.label(
+                RichText::new(format!("{m}+N nuevo match · {m}+R registrar · Esc cierra ventanas")).small().color(DIM),
+            );
         });
     });
 }
@@ -1371,7 +1415,7 @@ pub fn modal(ctx: &egui::Context, app: &mut GuiApp) {
                 } else {
                     primary_button("Guardar")
                 };
-                if ui.add(ok).on_hover_text("Ctrl+Enter").clicked() {
+                if ui.add(ok).on_hover_text(format!("{}+Enter", mod_key())).clicked() {
                     submit = true;
                 }
                 if ui.add(secondary_button("Cancelar")).clicked() {
@@ -1418,17 +1462,15 @@ fn match_form(ui: &mut Ui, d: &mut MatchDraft, tags: &[Tag]) {
         form_label(ui, "Frase de su bio");
         ui.add(TextEdit::singleline(&mut d.bio_highlight).hint_text("Si no te gusta mi perro…").desired_width(340.0));
         ui.end_row();
-        form_label(ui, "Foto (ruta local)");
-        ui.add(TextEdit::singleline(&mut d.avatar_path).hint_text(r"C:\fotos\match.jpg").desired_width(340.0));
-        ui.end_row();
         form_label(ui, "Top 4");
         ui.checkbox(&mut d.is_favorite, RichText::new("◆ Mostrar en el perfil").color(BLUE));
         ui.end_row();
     });
-    let path = d.avatar_path.trim();
-    if !path.is_empty() && !Path::new(path).exists() {
-        ui.label(RichText::new("No encuentro esa imagen; se usará un póster generado.").small().color(ORANGE));
-    }
+
+    // Fuera del Grid: su altura (póster de 90 px) descuadraría las filas.
+    ui.add_space(10.0);
+    form_label(ui, "Foto");
+    photo_picker(ui, d);
 
     ui.add_space(10.0);
     form_label(ui, "Flags");
@@ -1441,6 +1483,45 @@ fn match_form(ui: &mut Ui, d: &mut MatchDraft, tags: &[Tag]) {
                 d.toggle_tag(tag.id);
             }
         }
+    });
+}
+
+/// Vista previa + botones para elegir la foto con el diálogo nativo.
+/// La copia a la carpeta de la app ocurre al guardar (`AppState::submit_modal`).
+fn photo_picker(ui: &mut Ui, d: &mut MatchDraft) {
+    ui.horizontal(|ui| {
+        let mut preview = MatchProfile::new(d.alias.clone(), d.platform, d.status);
+        preview.id = d.editing_id.unwrap_or(0);
+        preview.avatar_path = Some(d.avatar_path.trim().to_string()).filter(|p| !p.is_empty());
+        let (rect, _) = ui.allocate_exact_size(vec2(60.0, 90.0), Sense::hover());
+        paint_poster(ui, rect, &preview);
+
+        ui.vertical(|ui| {
+            ui.horizontal(|ui| {
+                if ui.add(secondary_button("Elegir foto…")).clicked()
+                    && let Some(file) = rfd::FileDialog::new()
+                        .set_title("Elige una foto del match")
+                        .add_filter("Imágenes", PHOTO_EXTENSIONS)
+                        .pick_file()
+                {
+                    d.avatar_path = file.display().to_string();
+                }
+                if !d.avatar_path.is_empty() && ui.add(danger_button("Quitar")).clicked() {
+                    d.avatar_path.clear();
+                }
+            });
+            let path = d.avatar_path.trim();
+            let (text, color) = if path.is_empty() {
+                ("Sin foto: se usará un póster con sus iniciales".to_string(), DIM)
+            } else if !Path::new(path).is_file() {
+                ("No encuentro esa imagen".to_string(), ORANGE)
+            } else {
+                let name = Path::new(path).file_name().map(|n| n.to_string_lossy().into_owned()).unwrap_or_default();
+                (truncate(&name, 40), TEXT)
+            };
+            ui.label(RichText::new(text).small().color(color));
+            ui.label(RichText::new("Se guarda una copia junto a la base de datos").small().color(DIM));
+        });
     });
 }
 

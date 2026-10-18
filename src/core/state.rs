@@ -6,6 +6,7 @@
 //! y pintan lo que exponen.
 
 use std::collections::{BTreeSet, HashMap};
+use std::path::Path;
 
 use anyhow::Result;
 use chrono::{Local, NaiveDate};
@@ -910,13 +911,23 @@ impl AppState {
     fn apply_modal(&mut self, db: &Database, modal: &Modal) -> Result<Result<String, String>> {
         Ok(Ok(match modal {
             Modal::MatchForm(draft) => {
-                let profile = match draft.to_profile() {
+                let mut profile = match draft.to_profile() {
                     Ok(p) => p,
                     Err(e) => return Ok(Err(e)),
                 };
-                let was_favorite = draft.editing_id.and_then(|id| self.card(id)).is_some_and(|c| c.profile.is_favorite);
+                let previous = draft.editing_id.and_then(|id| self.card(id)).map(|c| c.profile.clone());
+                let was_favorite = previous.as_ref().is_some_and(|p| p.is_favorite);
                 if profile.is_favorite && !was_favorite && self.favorites().len() >= MAX_FAVORITES {
                     return Ok(Err(format!("El Top {MAX_FAVORITES} está lleno")));
+                }
+                // Una foto elegida fuera de la carpeta de la app se copia dentro.
+                if let Some(path) = profile.avatar_path.clone()
+                    && !db.is_managed_photo(&path)
+                {
+                    match db.import_photo(Path::new(&path)) {
+                        Ok(stored) => profile.avatar_path = Some(stored),
+                        Err(e) => return Ok(Err(format!("{e:#}"))),
+                    }
                 }
                 let id = match draft.editing_id {
                     Some(_) => {
@@ -925,6 +936,12 @@ impl AppState {
                     }
                     None => db.insert_match(&profile)?,
                 };
+                // Sólo tras guardar con éxito: la foto reemplazada ya no se usa.
+                if let Some(old) = previous.and_then(|p| p.avatar_path)
+                    && profile.avatar_path.as_deref() != Some(old.as_str())
+                {
+                    db.remove_photo(&old);
+                }
                 let current: BTreeSet<i64> =
                     self.card(id).map(|c| c.tags.iter().map(|t| t.id).collect()).unwrap_or_default();
                 for tag_id in draft.tag_ids.difference(&current) {
@@ -988,7 +1005,13 @@ impl AppState {
             Modal::ConfirmDelete(target) => {
                 let msg = self.describe_delete(*target);
                 match *target {
-                    DeleteTarget::Match(id) => db.delete_match(id)?,
+                    DeleteTarget::Match(id) => {
+                        let photo = self.card(id).and_then(|c| c.profile.avatar_path.clone());
+                        db.delete_match(id)?;
+                        if let Some(photo) = photo {
+                            db.remove_photo(&photo);
+                        }
+                    }
                     DeleteTarget::Log(id) => db.delete_log(id)?,
                     DeleteTarget::List(id) => db.delete_list(id)?,
                     DeleteTarget::ListItem { list_id, match_id } => {
@@ -1129,5 +1152,40 @@ mod tests {
         st.open_delete(DeleteTarget::Match(id));
         st.submit_modal(&db).unwrap();
         assert!(st.card(id).is_none());
+    }
+
+    #[test]
+    fn match_form_imports_photo_and_cleans_up() {
+        let (db, mut st) = state();
+        let src = std::env::temp_dir().join(format!("tinderboxd_state_src_{}.jpg", std::process::id()));
+        std::fs::write(&src, b"jpg").unwrap();
+
+        st.open_new_match();
+        if let Some(Modal::MatchForm(d)) = &mut st.modal {
+            d.alias = "Con foto".into();
+            d.avatar_path = src.display().to_string();
+        }
+        st.submit_modal(&db).unwrap();
+        assert!(st.modal.is_none(), "{:?}", st.status);
+        let first = st.selected_card().unwrap().profile.avatar_path.clone().unwrap();
+        assert!(db.is_managed_photo(&first));
+
+        // Cambiar la foto borra la copia anterior.
+        st.open_edit_selected_match();
+        if let Some(Modal::MatchForm(d)) = &mut st.modal {
+            d.avatar_path = src.display().to_string();
+        }
+        st.submit_modal(&db).unwrap();
+        let second = st.selected_card().unwrap().profile.avatar_path.clone().unwrap();
+        assert_ne!(first, second);
+        assert!(!Path::new(&first).exists());
+
+        // Borrar el match borra su foto.
+        let id = st.selected_card().unwrap().profile.id;
+        st.open_delete(DeleteTarget::Match(id));
+        st.submit_modal(&db).unwrap();
+        assert!(!Path::new(&second).exists());
+        assert!(src.exists(), "el archivo original nunca se toca");
+        let _ = std::fs::remove_file(&src);
     }
 }
