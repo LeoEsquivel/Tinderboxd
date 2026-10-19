@@ -1,0 +1,5 @@
+Este archivo activa el modo portable de Tinderboxd.
+
+Mientras exista junto a los .exe, la base de datos y las fotos se guardan en la
+carpeta "datos" de aquí mismo (por ejemplo, en tu USB) en lugar de en %APPDATA%.
+Bórralo si prefieres usar la carpeta de datos de tu usuario.

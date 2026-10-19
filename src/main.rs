@@ -1,16 +1,13 @@
-mod core;
-mod gui;
-mod tui;
-
 use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
 
-use crate::core::db::{DB_FILE_NAME, Database, default_db_path};
-use crate::core::export::{self, ExportOptions, ExportTarget, ImportOptions};
-use crate::core::models::{OwnerFilter, format_score_dots, format_stars};
-use crate::core::state::AppState;
+use tinderboxd::core::db::{DB_FILE_NAME, Database, default_db_path};
+use tinderboxd::core::export::{self, ExportOptions, ExportTarget, ImportOptions};
+use tinderboxd::core::models::{OwnerFilter, format_score_dots, format_stars};
+use tinderboxd::core::state::AppState;
+use tinderboxd::{gui, tui};
 
 /// Tinderboxd: tu Letterboxd de matches y citas.
 #[derive(Parser, Debug)]
@@ -58,7 +55,8 @@ struct Cli {
     #[arg(long, value_name = "PERFIL", default_value = "yo", conflicts_with = "importar")]
     perfil: String,
 
-    /// Ruta del archivo SQLite. Por defecto, en la carpeta de datos del usuario.
+    /// Ruta del archivo SQLite. Por defecto, en la carpeta de datos del usuario
+    /// (o en `datos/` junto al ejecutable si hay un `portable.txt` a su lado).
     #[arg(long, default_value_os_t = default_db_path())]
     db: PathBuf,
 }
@@ -151,6 +149,16 @@ fn main() -> Result<()> {
 
 /// Volcado de los datos en consola (`--resumen`).
 fn print_summary(state: &AppState) {
+    use std::fmt::Write as _;
+    // El resumen se arma en memoria y se escribe de una vez (ver `write_stdout`):
+    // este `println!` local sustituye al de std sólo dentro de esta función.
+    let mut out = String::new();
+    macro_rules! println {
+        ($($arg:tt)*) => {
+            let _ = writeln!(out, $($arg)*);
+        };
+    }
+
     println!("\n══════════════ TINDERBOXD · resumen · perfil: {} ══════════════", state.filter_label());
     if !state.owners.is_empty() {
         let names: Vec<&str> = state.owners.iter().map(|o| o.name.as_str()).collect();
@@ -271,6 +279,15 @@ fn print_summary(state: &AppState) {
     }
 
     println!("\n  Leyenda sub-métricas: 3/5 = {}", format_score_dots(3));
+    write_stdout(&out);
+}
+
+/// Escribe en la salida estándar sin entrar en pánico si la tubería se cerró
+/// (`tinderboxd --resumen | head`): para un listado eso no es un error.
+fn write_stdout(text: &str) {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let _ = stdout.write_all(text.as_bytes()).and_then(|()| stdout.flush());
 }
 
 fn truncate(text: &str, max_chars: usize) -> String {

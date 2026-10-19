@@ -15,13 +15,15 @@ pub fn run(db: Database, notice: Option<String>) -> Result<()> {
         state.error(n);
     }
     #[allow(unused_mut)]
-    let mut options = eframe::NativeOptions {
-        viewport: eframe::egui::ViewportBuilder::default()
-            .with_title("Tinderboxd")
-            .with_inner_size([1280.0, 820.0])
-            .with_min_inner_size([900.0, 600.0]),
-        ..Default::default()
-    };
+    let mut viewport = eframe::egui::ViewportBuilder::default()
+        .with_title("Tinderboxd")
+        .with_inner_size([1280.0, 820.0])
+        .with_min_inner_size([900.0, 600.0]);
+    if let Ok(icon) = eframe::icon_data::from_png_bytes(include_bytes!("../../assets/icon.png")) {
+        viewport = viewport.with_icon(icon);
+    }
+    #[allow(unused_mut)] // sólo se modifica en Linux (WSL)
+    let mut options = eframe::NativeOptions { viewport, ..Default::default() };
     #[cfg(target_os = "linux")]
     prefer_x11_on_wsl(&mut options);
 

@@ -1,0 +1,17 @@
+TINDERBOXD {{VERSION}} - versión portable
+======================================
+
+No necesita instalación: descomprime la carpeta donde quieras (también en una USB).
+
+  tinderboxd-gui.exe   La aplicación con ventana. Doble clic para abrirla.
+  tinderboxd.exe       Interfaz de terminal y línea de comandos. Ábrelo desde
+                       una terminal (Windows Terminal recomendado):
+                         .\tinderboxd.exe              interfaz de terminal
+                         .\tinderboxd.exe --help       todas las opciones
+                         .\tinderboxd.exe --importar amigo.json --de Ana
+
+Tus datos (base de datos y fotos) se guardan en la carpeta "datos" que se crea
+aquí al abrirla por primera vez, gracias a portable.txt. Para pasar a otro equipo,
+copia la carpeta entera.
+
+Funciona en Windows 10 y 11 (64 bits) sin instalar nada más.

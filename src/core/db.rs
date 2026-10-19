@@ -15,11 +15,24 @@ use super::models::*;
 /// Nombre por defecto del archivo de base de datos.
 pub const DB_FILE_NAME: &str = "tinderboxd.db";
 
-/// Ubicación por defecto de la base de datos: la carpeta de datos del usuario
-/// (`%APPDATA%\tinderboxd` en Windows, `~/.local/share/tinderboxd` en Linux,
-/// `~/Library/Application Support/tinderboxd` en macOS). Así da igual desde qué
-/// carpeta se ejecute el comando.
+/// Si este archivo está junto al ejecutable, Tinderboxd funciona en modo portable.
+pub const PORTABLE_MARKER: &str = "portable.txt";
+
+/// Carpeta de datos en modo portable (`datos/` junto al ejecutable), si está activo.
+pub fn portable_data_dir() -> Option<PathBuf> {
+    let exe_dir = std::env::current_exe().ok()?.parent()?.to_path_buf();
+    exe_dir.join(PORTABLE_MARKER).is_file().then(|| exe_dir.join("datos"))
+}
+
+/// Ubicación por defecto de la base de datos:
+/// - modo portable: `datos/` junto al ejecutable (p. ej. en una USB);
+/// - si no, la carpeta de datos del usuario (`%APPDATA%\tinderboxd` en Windows,
+///   `~/.local/share/tinderboxd` en Linux, `~/Library/Application Support/tinderboxd`
+///   en macOS). Así da igual desde qué carpeta se ejecute el comando.
 pub fn default_db_path() -> PathBuf {
+    if let Some(dir) = portable_data_dir() {
+        return dir.join(DB_FILE_NAME);
+    }
     match dirs::data_dir() {
         Some(dir) => dir.join("tinderboxd").join(DB_FILE_NAME),
         None => PathBuf::from(DB_FILE_NAME),

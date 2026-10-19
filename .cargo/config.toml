@@ -1,0 +1,5 @@
+# Windows: incluir el runtime de C (vcruntime140.dll) dentro de los .exe, para que
+# funcionen en cualquier equipo sin instalar "Microsoft Visual C++ Redistributable"
+# (necesario para la versión portable).
+[target.'cfg(all(windows, target_env = "msvc"))']
+rustflags = ["-C", "target-feature=+crt-static"]
