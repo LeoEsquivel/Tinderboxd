@@ -3,5 +3,6 @@
 //! Regla de oro: nada en este módulo importa tipos de `egui` ni de `ratatui`.
 
 pub mod db;
+pub mod export;
 pub mod models;
 pub mod state;

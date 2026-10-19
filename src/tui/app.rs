@@ -48,6 +48,9 @@ pub enum Field {
     // Tag
     TagName,
     TagKind,
+    // Importar
+    ImportPath,
+    ImportPrefix,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -90,6 +93,7 @@ const REVIEW_FIELDS: &[Field] = &[
 const LIST_FIELDS: &[Field] = &[Field::ListTitle, Field::ListDescription, Field::ListRanked];
 const ITEM_FIELDS: &[Field] = &[Field::ItemMatch, Field::ItemNote];
 const TAG_FIELDS: &[Field] = &[Field::TagName, Field::TagKind];
+const IMPORT_FIELDS: &[Field] = &[Field::ImportPath, Field::ImportPrefix];
 
 pub fn form_fields(modal: &Modal) -> &'static [Field] {
     match modal {
@@ -98,6 +102,7 @@ pub fn form_fields(modal: &Modal) -> &'static [Field] {
         Modal::ListForm(_) => LIST_FIELDS,
         Modal::ListItemForm(_) => ITEM_FIELDS,
         Modal::TagForm(_) => TAG_FIELDS,
+        Modal::ImportForm(_) => IMPORT_FIELDS,
         Modal::ConfirmDelete(_) => &[],
     }
 }
@@ -128,6 +133,8 @@ impl Field {
             Field::ItemNote => "Nota",
             Field::TagName => "Nombre",
             Field::TagKind => "Categoría",
+            Field::ImportPath => "Archivo JSON",
+            Field::ImportPrefix => "Prefijo (opcional)",
         }
     }
 
@@ -143,7 +150,9 @@ impl Field {
             | Field::ListTitle
             | Field::ListDescription
             | Field::ItemNote
-            | Field::TagName => FieldKind::Text,
+            | Field::TagName
+            | Field::ImportPath
+            | Field::ImportPrefix => FieldKind::Text,
             Field::Platform
             | Field::Status
             | Field::ReviewMatch
@@ -172,6 +181,8 @@ fn text_mut(modal: &mut Modal, field: Field) -> Option<&mut String> {
         (Modal::ListForm(d), Field::ListDescription) => Some(&mut d.description),
         (Modal::ListItemForm(d), Field::ItemNote) => Some(&mut d.note),
         (Modal::TagForm(d), Field::TagName) => Some(&mut d.name),
+        (Modal::ImportForm(d), Field::ImportPath) => Some(&mut d.path),
+        (Modal::ImportForm(d), Field::ImportPrefix) => Some(&mut d.alias_prefix),
         _ => None,
     }
 }
@@ -385,6 +396,8 @@ impl TuiApp {
             KeyCode::Char('f') => self.state.toggle_favorite_selected(&self.db)?,
             KeyCode::Char('s') => self.state.cycle_status_selected(&self.db)?,
             KeyCode::Char('t') => self.state.open_new_tag(),
+            KeyCode::Char('E') => self.state.quick_export(&self.db)?,
+            KeyCode::Char('I') => self.state.open_import(None),
             KeyCode::Char('v') => {
                 self.reveal_spoilers = !self.reveal_spoilers;
                 self.state.info(if self.reveal_spoilers {
@@ -570,6 +583,10 @@ impl TuiApp {
     fn focus_field(&mut self, index: usize) {
         self.form_focus = index;
         self.tag_cursor = 0;
+        // Al salir del campo de ruta, leer el archivo para mostrar qué contiene.
+        if let Some(Modal::ImportForm(d)) = &mut self.state.modal {
+            d.refresh_preview();
+        }
     }
 
     fn change_field(&mut self, field: Field, delta: i32) {
@@ -752,6 +769,28 @@ mod tests {
         assert_eq!(app.state.visible_cards().len(), 1);
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.state.visible_cards().len(), 4);
+    }
+
+    #[test]
+    fn export_and_import_with_keyboard() {
+        let mut app = app();
+        app.state.set_tab(Tab::Stats);
+        press(&mut app, KeyCode::Char('E'));
+        let msg = app.state.status.clone().unwrap();
+        assert!(!msg.is_error, "{}", msg.text);
+        let path = msg.text.split(" a ").last().unwrap().to_string();
+        assert!(std::path::Path::new(&path).is_file(), "{path}");
+
+        press(&mut app, KeyCode::Char('I'));
+        type_text(&mut app, &path);
+        press(&mut app, KeyCode::Tab); // al salir del campo se lee el archivo
+        type_text(&mut app, "Ana");
+        assert!(draw(&app, 120, 40).contains("Respaldo completo"));
+        press(&mut app, KeyCode::Enter);
+        assert!(app.state.modal.is_none(), "{:?}", app.state.status);
+        assert_eq!(app.state.cards.len(), 8);
+        assert!(app.state.cards.iter().any(|c| c.profile.alias == "Ana · Crypto Bro de Polanco"));
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `cargo test preview -- --ignored --nocapture` imprime las pantallas.

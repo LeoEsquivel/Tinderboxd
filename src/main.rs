@@ -1,6 +1,3 @@
-// Parte del CRUD de lectura de `core` (get_match, logs_for_match…) sólo la usan los
-// tests por ahora; la consumirá `export.rs` en la Fase 4.
-#[allow(dead_code)]
 mod core;
 mod gui;
 mod tui;
@@ -8,27 +5,53 @@ mod tui;
 use std::path::PathBuf;
 
 use anyhow::Result;
-use clap::Parser;
+use clap::{ArgGroup, Parser};
 
 use crate::core::db::{DEFAULT_DB_PATH, Database};
+use crate::core::export::{self, ExportOptions, ExportTarget, ImportOptions};
 use crate::core::models::{format_score_dots, format_stars};
 use crate::core::state::AppState;
 
 /// Tinderboxd: tu Letterboxd de matches y citas.
 #[derive(Parser, Debug)]
 #[command(name = "tinderboxd", version, about)]
+#[command(group(ArgGroup::new("modo").args(["tui", "gui", "resumen", "exportar", "importar"])))]
 struct Cli {
     /// Lanza la interfaz de terminal (ratatui). Es la opción por defecto.
-    #[arg(long, conflicts_with_all = ["gui", "resumen"])]
+    #[arg(long)]
     tui: bool,
 
     /// Lanza la interfaz de escritorio (egui).
-    #[arg(long, conflicts_with = "resumen")]
+    #[arg(long)]
     gui: bool,
 
     /// Imprime en consola un resumen de los datos y las estadísticas, y termina.
     #[arg(long)]
     resumen: bool,
+
+    /// Exporta a un archivo JSON (todo, o un match/lista con --solo-match/--solo-lista).
+    #[arg(long, value_name = "ARCHIVO")]
+    exportar: Option<PathBuf>,
+
+    /// Con --exportar: sólo este match (id o parte del alias).
+    #[arg(long, value_name = "MATCH", requires = "exportar", conflicts_with = "solo_lista")]
+    solo_match: Option<String>,
+
+    /// Con --exportar: sólo esta lista y sus matches (id o parte del título).
+    #[arg(long, value_name = "LISTA", requires = "exportar")]
+    solo_lista: Option<String>,
+
+    /// Con --exportar: no incluir las fotos en el JSON.
+    #[arg(long, requires = "exportar")]
+    sin_fotos: bool,
+
+    /// Importa un archivo JSON exportado por Tinderboxd.
+    #[arg(long, value_name = "ARCHIVO")]
+    importar: Option<PathBuf>,
+
+    /// Con --importar: prefijo para los alias (p. ej. el nombre de tu amigo).
+    #[arg(long, value_name = "NOMBRE", requires = "importar")]
+    de: Option<String>,
 
     /// Ruta del archivo SQLite.
     #[arg(long, default_value = DEFAULT_DB_PATH)]
@@ -38,8 +61,30 @@ struct Cli {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    let is_new = !cli.db.exists();
     let db = Database::open(&cli.db)?;
-    let seeded = db.seed_if_empty()?;
+
+    if let Some(path) = &cli.exportar {
+        let target = match (&cli.solo_match, &cli.solo_lista) {
+            (Some(q), _) => ExportTarget::Match(export::find_match(&db, q)?),
+            (_, Some(q)) => ExportTarget::List(export::find_list(&db, q)?),
+            _ => ExportTarget::All,
+        };
+        let opts = ExportOptions { include_photos: !cli.sin_fotos };
+        let bundle = export::export_to_file(&db, target, opts, path)?;
+        println!("✔ {}", bundle.describe());
+        println!("  Guardado en {}", path.display());
+        return Ok(());
+    }
+    if let Some(path) = &cli.importar {
+        let report = export::import_file(&db, path, &ImportOptions { alias_prefix: cli.de.clone() })?;
+        println!("✔ {}", report.summary());
+        return Ok(());
+    }
+
+    // Los datos de ejemplo sólo se insertan al crear la base de datos: si borras
+    // todos tus matches no deben reaparecer, y nunca se mezclan con una importación.
+    let seeded = is_new && db.seed_if_empty()?;
 
     if cli.resumen {
         if seeded {

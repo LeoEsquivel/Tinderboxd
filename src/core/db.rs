@@ -179,6 +179,15 @@ fn list_from_row(row: &Row<'_>) -> rusqlite::Result<CustomList> {
     })
 }
 
+/// Extensión (en minúsculas) de una foto, si es un formato soportado.
+pub fn photo_extension(path: &Path) -> Result<String> {
+    path.extension()
+        .and_then(|e| e.to_str())
+        .map(str::to_lowercase)
+        .filter(|e| PHOTO_EXTENSIONS.contains(&e.as_str()))
+        .ok_or_else(|| anyhow!("Formato de imagen no soportado: usa PNG, JPG o WEBP"))
+}
+
 fn validate_sub_score(name: &str, score: Option<u8>) -> Result<()> {
     if let Some(s) = score
         && !(1..=5).contains(&s)
@@ -218,7 +227,8 @@ impl Database {
         Self::from_connection(conn, base.join(PHOTOS_DIR))
     }
 
-    /// Base de datos efímera (tests, previsualizaciones de import).
+    /// Base de datos efímera para los tests.
+    #[cfg(test)]
     pub fn open_in_memory() -> Result<Self> {
         let photos = std::env::temp_dir().join(format!("{PHOTOS_DIR}_{}", std::process::id()));
         Self::from_connection(Connection::open_in_memory()?, photos)
@@ -231,14 +241,23 @@ impl Database {
         Ok(db)
     }
 
+    /// Ejecuta `f` dentro de una transacción: si devuelve error, no queda nada a medias.
+    pub fn transaction<T>(&self, f: impl FnOnce(&Database) -> Result<T>) -> Result<T> {
+        let tx = self.conn.unchecked_transaction()?;
+        let out = f(self)?;
+        tx.commit()?;
+        Ok(out)
+    }
+
+    /// Carpeta donde vive la base de datos (y la carpeta de fotos).
+    pub fn data_dir(&self) -> &Path {
+        self.photos_dir.parent().unwrap_or(&self.photos_dir)
+    }
+
     // ------------------------------------------------------------------- fotos
     //
     // En SQLite las fotos gestionadas se guardan como nombre de archivo relativo a
     // `photos_dir`; hacia fuera `MatchProfile::avatar_path` siempre es absoluta.
-
-    pub fn photos_dir(&self) -> &Path {
-        &self.photos_dir
-    }
 
     /// `true` si la ruta apunta a una foto ya copiada en la carpeta de la app.
     pub fn is_managed_photo(&self, path: &str) -> bool {
@@ -250,12 +269,17 @@ impl Database {
         if !src.is_file() {
             bail!("No encuentro la imagen {}", src.display());
         }
-        let ext = src
-            .extension()
-            .and_then(|e| e.to_str())
-            .map(str::to_lowercase)
-            .filter(|e| PHOTO_EXTENSIONS.contains(&e.as_str()))
-            .ok_or_else(|| anyhow!("Formato de imagen no soportado: usa PNG, JPG o WEBP"))?;
+        let ext = photo_extension(src)?;
+        let bytes = fs::read(src).with_context(|| format!("no se pudo leer {}", src.display()))?;
+        self.import_photo_bytes(&bytes, &ext)
+    }
+
+    /// Guarda una foto (p. ej. decodificada de un JSON importado) en la carpeta de fotos.
+    pub fn import_photo_bytes(&self, bytes: &[u8], ext: &str) -> Result<String> {
+        let ext = ext.to_lowercase();
+        if !PHOTO_EXTENSIONS.contains(&ext.as_str()) {
+            bail!("Formato de imagen no soportado ({ext}): usa PNG, JPG o WEBP");
+        }
         fs::create_dir_all(&self.photos_dir)
             .with_context(|| format!("no se pudo crear {}", self.photos_dir.display()))?;
 
@@ -266,7 +290,7 @@ impl Database {
             SEQ.fetch_add(1, Ordering::Relaxed)
         );
         let dest = self.photos_dir.join(name);
-        fs::copy(src, &dest).with_context(|| format!("no se pudo copiar {}", src.display()))?;
+        fs::write(&dest, bytes).with_context(|| format!("no se pudo escribir {}", dest.display()))?;
         Ok(dest.to_string_lossy().into_owned())
     }
 
@@ -367,15 +391,6 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    pub fn matches_by_status(&self, status: MatchStatus) -> Result<Vec<MatchProfile>> {
-        let sql = format!(
-            "SELECT {MATCH_COLS} FROM matches m WHERE m.status = ?1
-             ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC"
-        );
-        let mut stmt = self.conn.prepare(&sql)?;
-        let rows = stmt.query_map([status], |r| self.match_row(r, 0))?;
-        Ok(rows.collect::<rusqlite::Result<_>>()?)
-    }
 
     /// El "Top 4" del perfil.
     pub fn favorites(&self) -> Result<Vec<MatchProfile>> {
@@ -491,6 +506,7 @@ impl Database {
         Ok(())
     }
 
+    #[cfg(test)]
     pub fn get_log(&self, id: i64) -> Result<Option<InteractionLog>> {
         let sql = format!("SELECT {LOG_COLS} FROM logs l WHERE l.id = ?1");
         Ok(self.conn.query_row(&sql, [id], |r| log_from_row(r, 0)).optional()?)
@@ -544,19 +560,6 @@ impl Database {
             Some(id) => Ok(id),
             None => self.create_tag(name, category),
         }
-    }
-
-    pub fn update_tag(&self, tag: &Tag) -> Result<()> {
-        self.conn.execute(
-            "UPDATE tags SET name = ?2, category = ?3 WHERE id = ?1",
-            params![tag.id, tag.name.trim(), tag.category],
-        )?;
-        Ok(())
-    }
-
-    pub fn delete_tag(&self, id: i64) -> Result<()> {
-        self.conn.execute("DELETE FROM tags WHERE id = ?1", [id])?;
-        Ok(())
     }
 
     pub fn list_tags(&self) -> Result<Vec<Tag>> {
@@ -842,9 +845,7 @@ impl Database {
         if !self.is_empty()? {
             return Ok(false);
         }
-        let tx = self.conn.unchecked_transaction()?;
-        seed(self)?;
-        tx.commit()?;
+        self.transaction(seed)?;
         Ok(true)
     }
 }

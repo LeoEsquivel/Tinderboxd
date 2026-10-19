@@ -12,6 +12,7 @@ use anyhow::Result;
 use chrono::{Local, NaiveDate};
 
 use super::db::{Database, MAX_FAVORITES};
+use super::export::{self, ExportOptions, ExportTarget, ImportOptions};
 use super::models::*;
 
 // ---------------------------------------------------------------------------
@@ -458,13 +459,35 @@ pub struct ListItemDraft {
     pub note: String,
 }
 
+/// Borrador para importar un archivo JSON de Tinderboxd.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct ImportDraft {
+    pub path: String,
+    /// Prefijo para los alias importados (p. ej. el nombre de quien te lo pasó).
+    pub alias_prefix: String,
+    /// Resumen del archivo, o el error al leerlo (tras `refresh_preview`).
+    pub preview: Option<Result<String, String>>,
+}
+
+impl ImportDraft {
+    pub fn refresh_preview(&mut self) {
+        let path = self.path.trim();
+        self.preview = (!path.is_empty()).then(|| {
+            export::read_file(Path::new(path)).map(|b| b.describe()).map_err(|e| format!("{e:#}"))
+        });
+    }
+
+    fn options(&self) -> ImportOptions {
+        ImportOptions { alias_prefix: non_empty(&self.alias_prefix) }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DeleteTarget {
     Match(i64),
     Log(i64),
     List(i64),
     ListItem { list_id: i64, match_id: i64 },
-    Tag(i64),
 }
 
 /// Ventana modal abierta (formularios y confirmaciones).
@@ -475,6 +498,7 @@ pub enum Modal {
     ListForm(ListDraft),
     ListItemForm(ListItemDraft),
     TagForm(TagDraft),
+    ImportForm(ImportDraft),
     ConfirmDelete(DeleteTarget),
 }
 
@@ -663,14 +687,6 @@ impl AppState {
         self.active_tab = tab;
         self.clamp_cursor(tab);
         self.sync_selection();
-    }
-
-    pub fn next_tab(&mut self) {
-        self.set_tab(self.active_tab.next());
-    }
-
-    pub fn prev_tab(&mut self) {
-        self.set_tab(self.active_tab.prev());
     }
 
     /// Mueve el cursor de la pestaña activa (negativo = arriba) y actualiza la selección.
@@ -877,10 +893,6 @@ impl AppState {
                 "¿Quitar a «{}» de la lista?",
                 self.card(match_id).map(|c| c.profile.alias.as_str()).unwrap_or("?")
             ),
-            DeleteTarget::Tag(id) => format!(
-                "¿Borrar el tag «{}» de todos los matches?",
-                self.tags.iter().find(|t| t.id == id).map(|t| t.name.as_str()).unwrap_or("?")
-            ),
         }
     }
 
@@ -1002,6 +1014,17 @@ impl AppState {
                 db.create_tag(&name, draft.category)?;
                 format!("Tag {} {name} creado", draft.category.emoji())
             }
+            Modal::ImportForm(draft) => {
+                let path = draft.path.trim();
+                if path.is_empty() {
+                    return Ok(Err("Indica el archivo a importar".to_string()));
+                }
+                // Un archivo inválido es un error de validación: el formulario sigue abierto.
+                match export::import_file(db, Path::new(path), &draft.options()) {
+                    Ok(report) => report.summary(),
+                    Err(e) => return Ok(Err(format!("{e:#}"))),
+                }
+            }
             Modal::ConfirmDelete(target) => {
                 let msg = self.describe_delete(*target);
                 match *target {
@@ -1017,11 +1040,48 @@ impl AppState {
                     DeleteTarget::ListItem { list_id, match_id } => {
                         db.remove_list_item(list_id, match_id)?
                     }
-                    DeleteTarget::Tag(id) => db.delete_tag(id)?,
                 }
                 format!("Hecho: {}", msg.trim_start_matches('¿').trim_end_matches('?'))
             }
         }))
+    }
+
+    // ------------------------------------------------------ exportar / importar
+
+    /// Qué exportar según la pestaña: el match o la lista seleccionados; si no, todo.
+    pub fn export_target(&self) -> ExportTarget {
+        match self.active_tab {
+            Tab::Cartelera | Tab::Watchlist => {
+                self.selected_match.map(ExportTarget::Match).unwrap_or(ExportTarget::All)
+            }
+            Tab::Lists => self.selected_list.map(ExportTarget::List).unwrap_or(ExportTarget::All),
+            _ => ExportTarget::All,
+        }
+    }
+
+    /// Exporta a `path` y deja un mensaje con lo que se guardó.
+    pub fn export_to(&mut self, db: &Database, target: ExportTarget, path: &Path, opts: ExportOptions) -> Result<()> {
+        let bundle = export::export_to_file(db, target, opts, path)?;
+        self.info(format!(
+            "Exportado {} {} a {}",
+            bundle.matches.len(),
+            if bundle.matches.len() == 1 { "match" } else { "matches" },
+            path.display()
+        ));
+        Ok(())
+    }
+
+    /// Exporta lo seleccionado junto a la base de datos con un nombre sugerido.
+    pub fn quick_export(&mut self, db: &Database) -> Result<()> {
+        let target = self.export_target();
+        let path = db.data_dir().join(export::suggested_file_name(db, target)?);
+        self.export_to(db, target, &path, ExportOptions::default())
+    }
+
+    pub fn open_import(&mut self, path: Option<String>) {
+        let mut draft = ImportDraft { path: path.unwrap_or_default(), ..ImportDraft::default() };
+        draft.refresh_preview();
+        self.modal = Some(Modal::ImportForm(draft));
     }
 
     // --------------------------------------------------------- acciones rápidas
@@ -1152,6 +1212,36 @@ mod tests {
         st.open_delete(DeleteTarget::Match(id));
         st.submit_modal(&db).unwrap();
         assert!(st.card(id).is_none());
+    }
+
+    #[test]
+    fn export_selection_and_import_form() {
+        let (db, mut st) = state();
+        st.set_tab(Tab::Lists);
+        assert!(matches!(st.export_target(), ExportTarget::List(_)));
+        st.set_tab(Tab::Stats);
+        assert_eq!(st.export_target(), ExportTarget::All);
+
+        let path = std::env::temp_dir().join(format!("tinderboxd_state_export_{}.json", std::process::id()));
+        st.export_to(&db, ExportTarget::All, &path, ExportOptions::default()).unwrap();
+        assert!(st.status.as_ref().unwrap().text.contains("4 matches"));
+
+        let dst = Database::open_in_memory().unwrap();
+        let mut other = AppState::load(&dst).unwrap();
+        other.open_import(Some(path.display().to_string()));
+        if let Some(Modal::ImportForm(d)) = &other.modal {
+            assert!(d.preview.as_ref().unwrap().as_ref().unwrap().contains("4 matches"));
+        }
+        other.submit_modal(&dst).unwrap();
+        assert!(other.modal.is_none(), "{:?}", other.status);
+        assert_eq!(other.cards.len(), 4);
+
+        // Archivo inexistente: error y el formulario sigue abierto.
+        other.open_import(Some("no-existe.json".into()));
+        other.submit_modal(&dst).unwrap();
+        assert!(other.modal.is_some());
+        assert!(other.status.as_ref().unwrap().is_error);
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]

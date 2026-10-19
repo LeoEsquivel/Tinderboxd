@@ -211,7 +211,13 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
                 ("d", "borrar"),
                 ("?", "ayuda"),
             ],
-            Tab::Stats => &[("Tab", "pestaña"), ("?", "ayuda"), ("q", "salir")],
+            Tab::Stats => &[
+                ("Tab", "pestaña"),
+                ("E", "exportar todo"),
+                ("I", "importar"),
+                ("?", "ayuda"),
+                ("q", "salir"),
+            ],
         }
     };
     let mut spans = vec![s(" ", TEXT)];
@@ -850,6 +856,7 @@ fn modal_title(app: &TuiApp, modal: &Modal) -> String {
             app.state.lists.iter().find(|l| l.id == d.list_id).map(|l| l.title.as_str()).unwrap_or("lista")
         ),
         Modal::TagForm(_) => "Nuevo flag".into(),
+        Modal::ImportForm(_) => "Importar JSON".into(),
         Modal::ConfirmDelete(_) => "Confirmar".into(),
     }
 }
@@ -938,6 +945,8 @@ fn field_value(app: &TuiApp, modal: &Modal, field: Field, focused: bool) -> Vec<
         (Modal::TagForm(d), Field::TagKind) => {
             choice(format!("● {}", d.category), tag_color(d.category), focused)
         }
+        (Modal::ImportForm(d), Field::ImportPath) => text(&d.path),
+        (Modal::ImportForm(d), Field::ImportPrefix) => text(&d.alias_prefix),
         _ => vec![],
     }
 }
@@ -965,7 +974,11 @@ fn render_modal(f: &mut Frame, area: Rect, app: &TuiApp, modal: &Modal) {
     let fields = form_fields(modal);
     let focused_field = app.focused_field();
     let width = area.width.saturating_sub(4).min(84);
-    let rect = area.centered(Constraint::Length(width), Constraint::Length((fields.len() as u16 + 9).min(area.height)));
+    let extra = if matches!(modal, Modal::ImportForm(_)) { 5 } else { 0 };
+    let rect = area.centered(
+        Constraint::Length(width),
+        Constraint::Length((fields.len() as u16 + 9 + extra).min(area.height)),
+    );
     f.render_widget(Clear, rect);
     let block = panel(&modal_title(app, modal), true).style(Style::new().bg(PANEL));
     let inner = block.inner(rect);
@@ -986,6 +999,18 @@ fn render_modal(f: &mut Frame, area: Rect, app: &TuiApp, modal: &Modal) {
         ];
         spans.extend(field_value(app, modal, *field, focused));
         lines.push(Line::from(spans));
+    }
+    if let Modal::ImportForm(d) = modal {
+        lines.push(Line::from(""));
+        lines.push(match &d.preview {
+            Some(Ok(summary)) => Line::from(s(format!("  {summary}"), GREEN)),
+            Some(Err(e)) => Line::from(s(format!("  {e}"), RED)),
+            None => Line::from(s("  Escribe la ruta del archivo (Tab para comprobarlo)", DIM)),
+        });
+        lines.push(Line::from(s(
+            "  El prefijo marca de quién son los matches: «Ana · La chica del perro…»",
+            DIM,
+        )));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), form_area);
 
@@ -1027,6 +1052,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("s", "Pasar al siguiente estado"),
         ("t", "Crear un flag (Red/Green/Neutral)"),
         ("v", "Mostrar/ocultar spoilers"),
+        ("E", "Exportar a JSON (match/lista seleccionados o todo)"),
+        ("I", "Importar un JSON de Tinderboxd"),
         ("/", "Buscar por alias, bio o flag"),
         ("p · c · o", "Filtrar app · filtrar estado · cambiar orden"),
         ("L · * · x", "Sólo ♥ · sólo Top 4 · limpiar filtros"),

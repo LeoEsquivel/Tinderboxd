@@ -7,6 +7,7 @@ use anyhow::Result;
 use eframe::egui;
 
 use crate::core::db::Database;
+use crate::core::export::{self, ExportOptions, ExportTarget};
 use crate::core::state::{AppState, StatusMessage, Tab};
 
 use super::views;
@@ -19,12 +20,40 @@ pub struct GuiApp {
     pub state: AppState,
     /// Logs cuyos spoilers se han destapado.
     pub revealed: HashSet<i64>,
+    /// Incluir las fotos al exportar (menú «Compartir»).
+    pub export_photos: bool,
     status_seen: Option<(StatusMessage, Instant)>,
 }
 
 impl GuiApp {
     pub fn new(db: Database, state: AppState) -> Self {
-        GuiApp { db, state, revealed: HashSet::new(), status_seen: None }
+        GuiApp { db, state, revealed: HashSet::new(), export_photos: true, status_seen: None }
+    }
+
+    /// Pide dónde guardar (diálogo nativo) y exporta.
+    pub fn export_with_dialog(&mut self, target: ExportTarget) {
+        let name = export::suggested_file_name(&self.db, target).unwrap_or_else(|_| "tinderboxd.json".into());
+        let Some(path) = rfd::FileDialog::new()
+            .set_title("Exportar a JSON")
+            .set_file_name(name)
+            .add_filter("JSON de Tinderboxd", &["json"])
+            .save_file()
+        else {
+            return;
+        };
+        let opts = ExportOptions { include_photos: self.export_photos };
+        self.act(|st, db| st.export_to(db, target, &path, opts));
+    }
+
+    /// Pide el archivo (diálogo nativo) y abre el formulario de importación con su resumen.
+    pub fn import_with_dialog(&mut self) {
+        if let Some(path) = rfd::FileDialog::new()
+            .set_title("Importar JSON de Tinderboxd")
+            .add_filter("JSON de Tinderboxd", &["json"])
+            .pick_file()
+        {
+            self.state.open_import(Some(path.display().to_string()));
+        }
     }
 
     /// Ejecuta una acción sobre estado + BD y convierte los errores en mensaje de estado.

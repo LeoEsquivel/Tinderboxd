@@ -14,9 +14,10 @@ use crate::core::models::{
     DiaryEntry, InteractionLog, MatchCard, MatchProfile, MatchStatus, Platform, StatsSummary, Tag,
     TagCategory, format_stars,
 };
+use crate::core::export::ExportTarget;
 use crate::core::state::{
-    AppState, DeleteTarget, ListDraft, ListItemDraft, MatchDraft, Modal, ReviewDraft, SortBy,
-    SubScore, Tab, TagDraft, today,
+    AppState, DeleteTarget, ImportDraft, ListDraft, ListItemDraft, MatchDraft, Modal, ReviewDraft,
+    SortBy, SubScore, Tab, TagDraft, today,
 };
 
 use super::app::GuiApp;
@@ -434,8 +435,8 @@ fn form_label(ui: &mut Ui, text: &str) {
 pub fn header(ui: &mut Ui, app: &mut GuiApp) {
     // Algunos gestores de ventanas ignoran el tamaño mínimo: compactar antes de solapar.
     let width = ui.available_width();
-    let show_wordmark = width >= 1000.0;
-    let compact_actions = width < 840.0;
+    let show_wordmark = width >= 1100.0;
+    let compact_actions = width < 920.0;
 
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(44.0, 22.0), Sense::hover());
@@ -477,6 +478,8 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
                     if ui.button("Flag").clicked() {
                         app.state.open_new_tag();
                     }
+                    ui.separator();
+                    share_menu_items(ui, app);
                 });
                 return;
             }
@@ -489,8 +492,24 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
             if ui.add(secondary_button("+ Flag")).clicked() {
                 app.state.open_new_tag();
             }
+            ui.menu_button(RichText::new("Compartir").color(BRIGHT), |ui| share_menu_items(ui, app));
         });
     });
+}
+
+/// Entradas del menú «Compartir»: respaldo completo, importar y opción de fotos.
+fn share_menu_items(ui: &mut Ui, app: &mut GuiApp) {
+    if ui.button("Exportar todo a JSON…").clicked() {
+        ui.close();
+        app.export_with_dialog(ExportTarget::All);
+    }
+    if ui.button("Importar JSON…").clicked() {
+        ui.close();
+        app.import_with_dialog();
+    }
+    ui.separator();
+    ui.checkbox(&mut app.export_photos, "Incluir fotos al exportar")
+        .on_hover_text("Las fotos viajan dentro del JSON: más pesado, pero un solo archivo basta");
 }
 
 pub fn status_bar(ui: &mut Ui, app: &mut GuiApp) {
@@ -760,6 +779,9 @@ fn match_detail(ui: &mut Ui, app: &mut GuiApp, card: &MatchCard) {
         }
         if ui.add(secondary_button("Editar")).clicked() {
             app.state.open_edit_selected_match();
+        }
+        if ui.add(secondary_button("Compartir")).on_hover_text("Exportar este match a JSON").clicked() {
+            app.export_with_dialog(ExportTarget::Match(p.id));
         }
         if ui.add(danger_button("Borrar")).clicked() {
             app.state.open_delete(DeleteTarget::Match(p.id));
@@ -1124,6 +1146,9 @@ pub fn lists(ui: &mut Ui, app: &mut GuiApp) {
             if ui.add(secondary_button("Editar")).clicked() {
                 app.state.open_edit_selected_list();
             }
+            if ui.add(secondary_button("Compartir lista")).on_hover_text("Exportar la lista y sus matches a JSON").clicked() {
+                app.export_with_dialog(ExportTarget::List(list.id));
+            }
             if ui.add(danger_button("Borrar lista")).clicked() {
                 app.state.open_delete(DeleteTarget::List(list.id));
             }
@@ -1361,6 +1386,7 @@ fn modal_title(state: &AppState, modal: &Modal) -> String {
             state.lists.iter().find(|l| l.id == d.list_id).map(|l| l.title.as_str()).unwrap_or("lista")
         ),
         Modal::TagForm(_) => "Nuevo flag".into(),
+        Modal::ImportForm(_) => "Importar JSON".into(),
         Modal::ConfirmDelete(_) => "¿Seguro?".into(),
     }
 }
@@ -1372,6 +1398,7 @@ pub fn modal(ctx: &egui::Context, app: &mut GuiApp) {
         Modal::ConfirmDelete(target) => Some(app.state.describe_delete(*target)),
         _ => None,
     };
+    let is_import = matches!(current, Modal::ImportForm(_));
 
     let mut submit = false;
     let mut cancel = false;
@@ -1393,6 +1420,7 @@ pub fn modal(ctx: &egui::Context, app: &mut GuiApp) {
             Some(Modal::ListForm(d)) => list_form(ui, d),
             Some(Modal::ListItemForm(d)) => item_form(ui, d, cards),
             Some(Modal::TagForm(d)) => tag_form(ui, d),
+            Some(Modal::ImportForm(d)) => import_form(ui, d),
             Some(Modal::ConfirmDelete(_)) => {
                 ui.label(RichText::new(delete_text.as_deref().unwrap_or("")).size(15.0).color(TEXT));
             }
@@ -1409,9 +1437,10 @@ pub fn modal(ctx: &egui::Context, app: &mut GuiApp) {
         ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                let is_delete = delete_text.is_some();
-                let ok = if is_delete {
+                let ok = if delete_text.is_some() {
                     Button::new(RichText::new("Borrar").strong().color(BRIGHT)).fill(RED.gamma_multiply(0.8))
+                } else if is_import {
+                    primary_button("Importar")
                 } else {
                     primary_button("Guardar")
                 };
@@ -1597,6 +1626,44 @@ fn item_form(ui: &mut Ui, d: &mut ListItemDraft, cards: &[MatchCard]) {
         ui.add(TextEdit::singleline(&mut d.note).hint_text("¿Por qué está en esta lista?").desired_width(340.0));
         ui.end_row();
     });
+}
+
+fn import_form(ui: &mut Ui, d: &mut ImportDraft) {
+    form_grid(ui, "import_form", |ui| {
+        form_label(ui, "Archivo");
+        ui.horizontal(|ui| {
+            let name = Path::new(d.path.trim())
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| "Ningún archivo elegido".into());
+            ui.label(RichText::new(truncate(&name, 38)).color(BRIGHT)).on_hover_text(&d.path);
+            if ui.add(secondary_button("Elegir…")).clicked()
+                && let Some(file) = rfd::FileDialog::new()
+                    .set_title("Importar JSON de Tinderboxd")
+                    .add_filter("JSON de Tinderboxd", &["json"])
+                    .pick_file()
+            {
+                d.path = file.display().to_string();
+                d.refresh_preview();
+            }
+        });
+        ui.end_row();
+        form_label(ui, "Prefijo (opcional)");
+        ui.add(TextEdit::singleline(&mut d.alias_prefix).hint_text("Nombre de tu amigo").desired_width(220.0));
+        ui.end_row();
+    });
+    ui.add_space(8.0);
+    match &d.preview {
+        Some(Ok(summary)) => ui.label(RichText::new(summary).color(GREEN)),
+        Some(Err(e)) => ui.label(RichText::new(e).color(RED)),
+        None => ui.label(RichText::new("Elige un archivo exportado desde Tinderboxd.").color(DIM)),
+    };
+    let example = if d.alias_prefix.trim().is_empty() {
+        "Los matches que ya tengas (mismo alias, app y fecha) no se duplican.".to_string()
+    } else {
+        format!("Los alias quedarán como «{} · La chica del perro gigante».", d.alias_prefix.trim())
+    };
+    ui.label(RichText::new(example).small().color(DIM));
 }
 
 fn tag_form(ui: &mut Ui, d: &mut TagDraft) {
