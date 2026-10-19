@@ -2,12 +2,12 @@ mod core;
 mod gui;
 mod tui;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 use clap::{ArgGroup, Parser};
 
-use crate::core::db::{DEFAULT_DB_PATH, Database};
+use crate::core::db::{DB_FILE_NAME, Database, default_db_path};
 use crate::core::export::{self, ExportOptions, ExportTarget, ImportOptions};
 use crate::core::models::{format_score_dots, format_stars};
 use crate::core::state::AppState;
@@ -53,16 +53,36 @@ struct Cli {
     #[arg(long, value_name = "NOMBRE", requires = "importar")]
     de: Option<String>,
 
-    /// Ruta del archivo SQLite.
-    #[arg(long, default_value = DEFAULT_DB_PATH)]
+    /// Ruta del archivo SQLite. Por defecto, en la carpeta de datos del usuario.
+    #[arg(long, default_value_os_t = default_db_path())]
     db: PathBuf,
+}
+
+/// Aviso si en la carpeta actual hay una base de datos de antes de usar la
+/// carpeta de datos del usuario (cuando se creaba junto a donde se ejecutaba).
+fn legacy_db_notice(cli: &Cli, is_new: bool) -> Option<String> {
+    let legacy = Path::new(DB_FILE_NAME);
+    let using_default = cli.db == default_db_path();
+    (using_default && is_new && legacy.is_file()).then(|| {
+        format!(
+            "Hay un {DB_FILE_NAME} en esta carpeta, pero ahora los datos viven en {}. \
+             Ábrelo con --db {DB_FILE_NAME} o muévelo allí (con su carpeta de fotos).",
+            cli.db.display()
+        )
+    })
 }
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
     let is_new = !cli.db.exists();
+    let notice = legacy_db_notice(&cli, is_new);
     let db = Database::open(&cli.db)?;
+    if let Some(n) = &notice
+        && (cli.exportar.is_some() || cli.importar.is_some() || cli.resumen)
+    {
+        eprintln!("⚠ {n}");
+    }
 
     if let Some(path) = &cli.exportar {
         let target = match (&cli.solo_match, &cli.solo_lista) {
@@ -93,9 +113,9 @@ fn main() -> Result<()> {
         print_summary(&AppState::load(&db)?);
         Ok(())
     } else if cli.gui {
-        gui::run(db)
+        gui::run(db, notice)
     } else {
-        tui::run(db)
+        tui::run(db, notice)
     }
 }
 

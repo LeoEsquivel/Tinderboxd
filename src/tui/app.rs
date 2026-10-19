@@ -1,10 +1,13 @@
 //! Event loop de la TUI: traduce teclas a llamadas sobre `AppState` / `Database`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell, RefMut};
+use std::collections::HashMap;
 
 use anyhow::Result;
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use ratatui_image::picker::Picker;
+use ratatui_image::protocol::StatefulProtocol;
 
 use crate::core::db::Database;
 use crate::core::models::{ListEntry, MatchCard};
@@ -257,10 +260,36 @@ pub struct TuiApp {
     pub entry_cursor: usize,
     /// Columnas de la cuadrícula de Matches en el último frame (para navegar con j/k).
     pub grid_cols: Cell<usize>,
+    /// Mostrar la foto en la ficha (`P`).
+    pub show_photos: bool,
+    /// Protocolo gráfico de la terminal (Sixel, Kitty, iTerm2 o bloques Unicode).
+    pub picker: Picker,
+    /// Fotos ya preparadas por ruta; `None` si no se pudo leer (no se reintenta).
+    photos: RefCell<HashMap<String, Option<StatefulProtocol>>>,
+}
+
+/// Lado máximo (px) al que se reduce una foto antes de enviarla a la terminal:
+/// codificar en Sixel una foto de 12 MP en cada redibujado sería muy lento.
+const PHOTO_MAX_PX: u32 = 600;
+
+fn load_photo(picker: &Picker, path: &str) -> Option<StatefulProtocol> {
+    let img = image::open(path).ok()?;
+    let img = if img.width().max(img.height()) > PHOTO_MAX_PX {
+        img.thumbnail(PHOTO_MAX_PX, PHOTO_MAX_PX)
+    } else {
+        img
+    };
+    Some(picker.new_resize_protocol(img))
 }
 
 impl TuiApp {
+    /// Con `Picker::halfblocks()`: funciona sin consultar la terminal.
+    #[cfg(test)]
     pub fn new(db: Database, state: AppState) -> Self {
+        Self::with_picker(db, state, Picker::halfblocks())
+    }
+
+    pub fn with_picker(db: Database, state: AppState, picker: Picker) -> Self {
         TuiApp {
             db,
             state,
@@ -272,7 +301,19 @@ impl TuiApp {
             list_pane: ListPane::Lists,
             entry_cursor: 0,
             grid_cols: Cell::new(1),
+            show_photos: true,
+            picker,
+            photos: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// Foto lista para dibujar (se decodifica una vez y queda en caché).
+    pub fn photo(&self, path: &str) -> Option<RefMut<'_, StatefulProtocol>> {
+        let cache = self.photos.borrow_mut();
+        RefMut::filter_map(cache, |c| {
+            c.entry(path.to_string()).or_insert_with(|| load_photo(&self.picker, path)).as_mut()
+        })
+        .ok()
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
@@ -396,6 +437,10 @@ impl TuiApp {
             KeyCode::Char('f') => self.state.toggle_favorite_selected(&self.db)?,
             KeyCode::Char('s') => self.state.cycle_status_selected(&self.db)?,
             KeyCode::Char('t') => self.state.open_new_tag(),
+            KeyCode::Char('P') => {
+                self.show_photos = !self.show_photos;
+                self.state.info(if self.show_photos { "Fotos visibles" } else { "Fotos ocultas" });
+            }
             KeyCode::Char('E') => self.state.quick_export(&self.db)?,
             KeyCode::Char('I') => self.state.open_import(None),
             KeyCode::Char('v') => {
@@ -769,6 +814,39 @@ mod tests {
         assert_eq!(app.state.visible_cards().len(), 1);
         press(&mut app, KeyCode::Char('x'));
         assert_eq!(app.state.visible_cards().len(), 4);
+    }
+
+    #[test]
+    fn photo_is_drawn_in_the_detail_panel() {
+        let mut app = app();
+        // PNG real de 40x60: mitad superior naranja, inferior azul.
+        let img = image::RgbImage::from_fn(40, 60, |_, y| {
+            if y < 30 { image::Rgb([255, 128, 0]) } else { image::Rgb([64, 188, 244]) }
+        });
+        let path = std::env::temp_dir().join(format!("tinderboxd_tui_photo_{}.png", std::process::id()));
+        img.save(&path).unwrap();
+        let stored = app.db.import_photo(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let id = app.state.cards[0].profile.id;
+        let mut profile = app.state.cards[0].profile.clone();
+        profile.avatar_path = Some(stored.clone());
+        app.db.update_match(&profile).unwrap();
+        app.state.refresh(&app.db).unwrap();
+        app.state.set_tab(Tab::Cartelera);
+        app.state.select_match(id);
+
+        let mut terminal = Terminal::new(TestBackend::new(140, 40)).unwrap();
+        terminal.draw(|f| views::render(f, &app)).unwrap();
+        let buf = terminal.backend().buffer();
+        let orange = ratatui::style::Color::Rgb(255, 128, 0);
+        let painted = buf.content().iter().filter(|c| c.fg == orange || c.bg == orange).count();
+        assert!(painted > 20, "la foto debería pintarse con bloques de color ({painted} celdas)");
+
+        // Con P se oculta y aparece la ruta en su lugar.
+        press(&mut app, KeyCode::Char('P'));
+        assert!(draw(&app, 140, 40).contains("P para mostrarla"));
+        app.db.remove_photo(&stored);
     }
 
     #[test]

@@ -13,7 +13,18 @@ use rusqlite::{Connection, OptionalExtension, Row, ToSql, params};
 use super::models::*;
 
 /// Nombre por defecto del archivo de base de datos.
-pub const DEFAULT_DB_PATH: &str = "tinderboxd.db";
+pub const DB_FILE_NAME: &str = "tinderboxd.db";
+
+/// Ubicación por defecto de la base de datos: la carpeta de datos del usuario
+/// (`%APPDATA%\tinderboxd` en Windows, `~/.local/share/tinderboxd` en Linux,
+/// `~/Library/Application Support/tinderboxd` en macOS). Así da igual desde qué
+/// carpeta se ejecute el comando.
+pub fn default_db_path() -> PathBuf {
+    match dirs::data_dir() {
+        Some(dir) => dir.join("tinderboxd").join(DB_FILE_NAME),
+        None => PathBuf::from(DB_FILE_NAME),
+    }
+}
 
 /// Tamaño máximo del "Top 4" del perfil.
 pub const MAX_FAVORITES: usize = 4;
@@ -221,6 +232,11 @@ impl Database {
     /// Abre (o crea) la base de datos en `path` y aplica el esquema.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let path = path.as_ref();
+        if let Some(parent) = path.parent()
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent).with_context(|| format!("no se pudo crear {}", parent.display()))?;
+        }
         let conn = Connection::open(path)
             .with_context(|| format!("no se pudo abrir la base de datos {}", path.display()))?;
         let base = std::path::absolute(path)?.parent().map(Path::to_path_buf).unwrap_or_default();

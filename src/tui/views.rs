@@ -14,6 +14,9 @@ use crate::core::models::{
 };
 use crate::core::state::{Modal, SortBy, Tab, today};
 
+use ratatui_image::{Resize, StatefulImage};
+use ratatui_image::protocol::StatefulProtocol;
+
 use super::app::{Field, FieldKind, ListPane, TuiApp, form_fields};
 
 // ---------------------------------------------------------------------------
@@ -35,6 +38,10 @@ const RED: Color = Color::Rgb(0xff, 0x55, 0x55);
 /// Ancho y alto de una tarjeta de la cuadrícula de Matches.
 const CARD_W: u16 = 28;
 const CARD_H: u16 = 6;
+
+/// Celdas para la foto de la ficha (las celdas son ~1:2, así que queda vertical).
+const PHOTO_W: u16 = 18;
+const PHOTO_H: u16 = 12;
 
 fn s(text: impl Into<String>, color: Color) -> Span<'static> {
     Span::styled(text.into(), Style::new().fg(color))
@@ -401,14 +408,15 @@ fn render_match_detail(f: &mut Frame, area: Rect, app: &TuiApp, card: Option<&Ma
         status.push(s("  ◆ Top 4", BLUE));
     }
 
-    let mut lines = vec![
+    // Cabecera (junto a la foto, si la hay) y cuerpo (debajo).
+    let mut header = vec![
         Line::from(bold(p.alias.clone(), BRIGHT)),
         Line::from(info),
         Line::from(status),
         Line::from(""),
     ];
     if card.log_count > 0 {
-        lines.push(Line::from(vec![
+        header.push(Line::from(vec![
             s(card.avg_stars(), GREEN),
             heart(card.liked),
             s(
@@ -422,17 +430,16 @@ fn render_match_detail(f: &mut Frame, area: Rect, app: &TuiApp, card: Option<&Ma
             ),
         ]));
     } else {
-        lines.push(Line::from(s("Sin reseñas todavía (r para registrar)", DIM)));
+        header.push(Line::from(s("Sin reseñas todavía (r para registrar)", DIM)));
     }
+
+    let mut lines = Vec::new();
     if let Some(bio) = &p.bio_highlight {
         lines.push(Line::from(""));
         lines.push(Line::from(Span::styled(
             format!("“{bio}”"),
             Style::new().fg(TEXT).add_modifier(Modifier::ITALIC),
         )));
-    }
-    if let Some(path) = &p.avatar_path {
-        lines.push(Line::from(s(format!("Foto: {path}"), DIM)));
     }
     if !card.tags.is_empty() {
         lines.push(Line::from(""));
@@ -458,7 +465,41 @@ fn render_match_detail(f: &mut Frame, area: Rect, app: &TuiApp, card: Option<&Ma
         }
     }
 
-    f.render_widget(Paragraph::new(lines).block(block).wrap(Wrap { trim: false }), area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    // Con un modal o la ayuda abiertos no se dibuja: un gráfico Sixel/Kitty quedaría encima.
+    let overlay_open = app.state.modal.is_some() || app.show_help;
+    let photo = p
+        .avatar_path
+        .as_deref()
+        .filter(|_| app.show_photos && !overlay_open && inner.width >= 40 && inner.height >= PHOTO_H + 3);
+    let body_area = match photo.and_then(|path| app.photo(path)) {
+        Some(mut protocol) => {
+            let [top, rest] = Layout::vertical([Constraint::Length(PHOTO_H), Constraint::Min(0)]).areas(inner);
+            let [img_area, header_area] =
+                Layout::horizontal([Constraint::Length(PHOTO_W), Constraint::Min(0)]).spacing(2).areas(top);
+            // Scale (no Fit): también agranda fotos pequeñas para llenar el hueco.
+            let widget = StatefulImage::<StatefulProtocol>::default()
+                .resize(Resize::Scale(Some(image::imageops::FilterType::Triangle)));
+            f.render_stateful_widget(widget, img_area, &mut *protocol);
+            f.render_widget(Paragraph::new(header).wrap(Wrap { trim: false }), header_area);
+            rest
+        }
+        None => {
+            if let Some(path) = &p.avatar_path
+                && !overlay_open
+            {
+                let hint = if app.show_photos { "no se pudo mostrar" } else { "P para mostrarla" };
+                let name = std::path::Path::new(path).file_name().map(|n| n.to_string_lossy()).unwrap_or_default();
+                header.push(Line::from(s(format!("Foto: {name} ({hint})"), DIM)));
+            }
+            header.append(&mut lines);
+            lines = header;
+            inner
+        }
+    };
+    f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), body_area);
 }
 
 // ---------------------------------------------------------------------------
@@ -1052,6 +1093,7 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("s", "Pasar al siguiente estado"),
         ("t", "Crear un flag (Red/Green/Neutral)"),
         ("v", "Mostrar/ocultar spoilers"),
+        ("P", "Mostrar/ocultar fotos en la ficha"),
         ("E", "Exportar a JSON (match/lista seleccionados o todo)"),
         ("I", "Importar un JSON de Tinderboxd"),
         ("/", "Buscar por alias, bio o flag"),

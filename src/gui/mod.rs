@@ -8,9 +8,12 @@ use anyhow::{Result, anyhow};
 use crate::core::db::Database;
 use crate::core::state::AppState;
 
-/// Abre la ventana nativa de Tinderboxd.
-pub fn run(db: Database) -> Result<()> {
-    let state = AppState::load(&db)?;
+/// Abre la ventana nativa de Tinderboxd. `notice` se muestra en la barra de estado.
+pub fn run(db: Database, notice: Option<String>) -> Result<()> {
+    let mut state = AppState::load(&db)?;
+    if let Some(n) = notice {
+        state.error(n);
+    }
     #[allow(unused_mut)]
     let mut options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()

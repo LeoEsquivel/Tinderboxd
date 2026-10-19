@@ -2,3 +2,5 @@
 *.db
 *.db-journal
 /tinderboxd_fotos
+# Exportaciones (pueden llevar fotos y reseñas privadas).
+/*.json

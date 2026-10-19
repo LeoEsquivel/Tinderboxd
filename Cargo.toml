@@ -11,11 +11,13 @@ base64 = "0.23.1"
 chrono = { version = "0.4.45", features = ["serde"] }
 clap = { version = "4.6.7", features = ["derive"] }
 crossterm = "0.29.0"
+dirs = "7.0.0"
 eframe = "0.37.0"
 egui_extras = { version = "0.37.0", features = ["file", "image"] }
 # Formatos de las fotos de los matches (pósters en la GUI).
 image = { version = "0.25.10", default-features = false, features = ["png", "jpeg", "webp"] }
 ratatui = "0.30.2"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["crossterm"] }
 rfd = "0.17.2"
 rusqlite = { version = "0.40.2", features = ["bundled", "chrono"] }
 serde = { version = "1.0.229", features = ["derive"] }
