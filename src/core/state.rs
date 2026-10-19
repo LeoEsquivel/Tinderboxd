@@ -270,6 +270,8 @@ impl MatchDraft {
             match_date: parse_optional_date("Fecha de match", &self.match_date)?,
             status: self.status,
             is_favorite: self.is_favorite,
+            // Sólo se crean/editan matches propios; `update_match` nunca cambia el dueño.
+            owner_id: None,
         })
     }
 }
@@ -434,6 +436,7 @@ impl ListDraft {
             title: non_empty(&self.title).ok_or("La lista necesita un título")?,
             description: non_empty(&self.description),
             is_ranked: self.is_ranked,
+            owner_id: None,
         })
     }
 }
@@ -463,8 +466,8 @@ pub struct ListItemDraft {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct ImportDraft {
     pub path: String,
-    /// Prefijo para los alias importados (p. ej. el nombre de quien te lo pasó).
-    pub alias_prefix: String,
+    /// Perfil donde se guarda (p. ej. el nombre de quien te lo pasó). Vacío = tus datos.
+    pub owner_name: String,
     /// Resumen del archivo, o el error al leerlo (tras `refresh_preview`).
     pub preview: Option<Result<String, String>>,
 }
@@ -478,7 +481,7 @@ impl ImportDraft {
     }
 
     fn options(&self) -> ImportOptions {
-        ImportOptions { alias_prefix: non_empty(&self.alias_prefix) }
+        ImportOptions { owner: non_empty(&self.owner_name) }
     }
 }
 
@@ -488,6 +491,8 @@ pub enum DeleteTarget {
     Log(i64),
     List(i64),
     ListItem { list_id: i64, match_id: i64 },
+    /// Un perfil importado con todo lo suyo.
+    Owner(i64),
 }
 
 /// Ventana modal abierta (formularios y confirmaciones).
@@ -516,6 +521,10 @@ pub struct StatusMessage {
 pub struct AppState {
     pub active_tab: Tab,
     pub filters: Filters,
+    /// Datos que se ven: los tuyos, los de un perfil importado o todos.
+    pub owner_filter: OwnerFilter,
+    /// Perfiles importados.
+    pub owners: Vec<Owner>,
 
     // Caché de datos (se recarga con `refresh`).
     pub cards: Vec<MatchCard>,
@@ -549,16 +558,23 @@ impl AppState {
 
     /// Recarga la caché desde la base de datos conservando la selección cuando sigue existiendo.
     pub fn refresh(&mut self, db: &Database) -> Result<()> {
-        self.cards = db.match_cards()?;
-        self.diary = db.diary(None)?;
-        self.lists = db.list_lists()?;
+        self.owners = db.list_owners()?;
+        if let OwnerFilter::Owner(id) = self.owner_filter
+            && !self.owners.iter().any(|o| o.id == id)
+        {
+            self.owner_filter = OwnerFilter::Mine;
+        }
+        let filter = self.owner_filter;
+        self.cards = db.match_cards(filter)?;
+        self.diary = db.diary(None, filter)?;
+        self.lists = db.list_lists(filter)?;
         self.list_entries = self
             .lists
             .iter()
             .map(|l| Ok((l.id, db.list_entries(l.id)?)))
             .collect::<Result<_>>()?;
         self.tags = db.list_tags()?;
-        self.stats = db.stats()?;
+        self.stats = db.stats(filter)?;
 
         if self.selected_match.is_some_and(|id| self.card(id).is_none()) {
             self.selected_match = None;
@@ -792,21 +808,145 @@ impl AppState {
         self.status = None;
     }
 
+    // ----------------------------------------------------------------- perfiles
+
+    /// Nombre de un dueño: "Tú" para tus datos.
+    pub fn owner_name(&self, owner_id: Option<i64>) -> String {
+        match owner_id {
+            None => "Tú".to_string(),
+            Some(id) => self.owners.iter().find(|o| o.id == id).map(|o| o.name.clone()).unwrap_or_else(|| "?".into()),
+        }
+    }
+
+    /// Etiqueta del filtro activo: "Tú", el nombre del perfil o "Todos".
+    pub fn filter_label(&self) -> String {
+        match self.owner_filter {
+            OwnerFilter::Mine => "Tú".to_string(),
+            OwnerFilter::Owner(id) => self.owner_name(Some(id)),
+            OwnerFilter::All => "Todos".to_string(),
+        }
+    }
+
+    /// Filtros disponibles en orden: Tú, cada perfil importado, Todos.
+    pub fn owner_filters(&self) -> Vec<OwnerFilter> {
+        let mut out = vec![OwnerFilter::Mine];
+        out.extend(self.owners.iter().map(|o| OwnerFilter::Owner(o.id)));
+        if !self.owners.is_empty() {
+            out.push(OwnerFilter::All);
+        }
+        out
+    }
+
+    /// Cambia los datos visibles; la selección y los cursores vuelven al inicio.
+    pub fn set_owner_filter(&mut self, db: &Database, filter: OwnerFilter) -> Result<()> {
+        if filter == self.owner_filter {
+            return Ok(());
+        }
+        self.owner_filter = filter;
+        self.selected_match = None;
+        self.selected_log = None;
+        self.selected_list = None;
+        self.cursors = Default::default();
+        self.refresh(db)?;
+        let label = self.filter_label();
+        self.info(match filter {
+            OwnerFilter::Owner(_) => format!("Viendo el perfil de {label} (sólo lectura)"),
+            _ => format!("Viendo: {label}"),
+        });
+        Ok(())
+    }
+
+    /// Pasa al siguiente filtro (Tú → perfiles → Todos → Tú).
+    pub fn cycle_owner_filter(&mut self, db: &Database) -> Result<()> {
+        let filters = self.owner_filters();
+        if filters.len() < 2 {
+            self.info("No hay perfiles importados: importa un JSON de un amigo para compararlo");
+            return Ok(());
+        }
+        let i = filters.iter().position(|f| *f == self.owner_filter).unwrap_or(0);
+        self.set_owner_filter(db, filters[(i + 1) % filters.len()])
+    }
+
+    /// `true` si se está viendo un perfil importado (todo es de sólo lectura).
+    pub fn is_read_only_view(&self) -> bool {
+        matches!(self.owner_filter, OwnerFilter::Owner(_))
+    }
+
+    /// Matches propios (para los selectores de reseñas e items de lista).
+    pub fn own_cards(&self) -> Vec<MatchCard> {
+        self.cards.iter().filter(|c| c.profile.owner_id.is_none()).cloned().collect()
+    }
+
+    /// Si el dato es de un perfil importado, avisa y devuelve `true` (no se puede tocar).
+    fn deny_foreign(&mut self, owner_id: Option<i64>) -> bool {
+        if owner_id.is_none() {
+            return false;
+        }
+        let name = self.owner_name(owner_id);
+        self.error(format!("Los datos de {name} son de sólo lectura: sirven para comparar"));
+        true
+    }
+
+    /// En la vista de un perfil importado no se crea nada nuevo.
+    fn deny_in_read_only_view(&mut self) -> bool {
+        if !self.is_read_only_view() {
+            return false;
+        }
+        let name = self.filter_label();
+        self.error(format!("Estás viendo el perfil de {name}: cambia a «Tú» para añadir cosas"));
+        true
+    }
+
+    fn list_owner(&self, list_id: i64) -> Option<i64> {
+        self.lists.iter().find(|l| l.id == list_id).and_then(|l| l.owner_id)
+    }
+
+    /// Dueño de lo que se quiere borrar (para no tocar datos importados).
+    fn target_owner(&self, target: DeleteTarget) -> Option<i64> {
+        match target {
+            DeleteTarget::Match(id) => self.card(id).and_then(|c| c.profile.owner_id),
+            DeleteTarget::Log(id) => self.log(id).and_then(|e| e.owner_id),
+            DeleteTarget::List(id) | DeleteTarget::ListItem { list_id: id, .. } => self.list_owner(id),
+            DeleteTarget::Owner(_) => None,
+        }
+    }
+
+    /// Confirmación para borrar el perfil que se está viendo (con todo lo importado).
+    pub fn open_delete_owner(&mut self) {
+        match self.owner_filter {
+            OwnerFilter::Owner(id) => self.modal = Some(Modal::ConfirmDelete(DeleteTarget::Owner(id))),
+            _ => self.error("Elige primero el perfil importado que quieres borrar"),
+        }
+    }
+
     // ----------------------------------------------------------------- modales
 
     pub fn open_new_match(&mut self) {
+        if self.deny_in_read_only_view() {
+            return;
+        }
         self.modal = Some(Modal::MatchForm(MatchDraft::default()));
     }
 
     pub fn open_edit_selected_match(&mut self) {
-        match self.selected_card() {
-            Some(card) => self.modal = Some(Modal::MatchForm(MatchDraft::from_card(card))),
-            None => self.error("Selecciona un match para editarlo"),
+        let Some(card) = self.selected_card().cloned() else {
+            self.error("Selecciona un match para editarlo");
+            return;
+        };
+        if !self.deny_foreign(card.profile.owner_id) {
+            self.modal = Some(Modal::MatchForm(MatchDraft::from_card(&card)));
         }
     }
 
     /// Nueva reseña para el match seleccionado (o sin match, para elegirlo en el formulario).
     pub fn open_new_review(&mut self) {
+        if self.deny_in_read_only_view() {
+            return;
+        }
+        let owner = self.selected_card().and_then(|c| c.profile.owner_id);
+        if self.deny_foreign(owner) {
+            return;
+        }
         let draft = match self.selected_match {
             Some(id) => ReviewDraft::for_match(id),
             None => ReviewDraft::default(),
@@ -815,34 +955,42 @@ impl AppState {
     }
 
     pub fn open_edit_selected_log(&mut self) {
-        match self.selected_entry() {
-            Some(e) => self.modal = Some(Modal::ReviewForm(ReviewDraft::from_log(&e.log))),
-            None => self.error("Selecciona una entrada del Diary para editarla"),
+        let Some(entry) = self.selected_entry().cloned() else {
+            self.error("Selecciona una entrada del Diary para editarla");
+            return;
+        };
+        if !self.deny_foreign(entry.owner_id) {
+            self.modal = Some(Modal::ReviewForm(ReviewDraft::from_log(&entry.log)));
         }
     }
 
     pub fn open_new_list(&mut self) {
+        if self.deny_in_read_only_view() {
+            return;
+        }
         self.modal = Some(Modal::ListForm(ListDraft::default()));
     }
 
     pub fn open_edit_selected_list(&mut self) {
-        match self.selected_list() {
-            Some(l) => self.modal = Some(Modal::ListForm(ListDraft::from_list(l))),
-            None => self.error("Selecciona una lista para editarla"),
+        let Some(list) = self.selected_list().cloned() else {
+            self.error("Selecciona una lista para editarla");
+            return;
+        };
+        if !self.deny_foreign(list.owner_id) {
+            self.modal = Some(Modal::ListForm(ListDraft::from_list(&list)));
         }
     }
 
     pub fn open_add_to_list(&mut self) {
-        match self.selected_list {
-            Some(list_id) => {
-                self.modal = Some(Modal::ListItemForm(ListItemDraft {
-                    list_id,
-                    match_id: self.selected_match,
-                    note: String::new(),
-                }))
-            }
-            None => self.error("Selecciona una lista primero"),
+        let Some(list_id) = self.selected_list else {
+            self.error("Selecciona una lista primero");
+            return;
+        };
+        if self.deny_foreign(self.list_owner(list_id)) {
+            return;
         }
+        let match_id = self.selected_card().filter(|c| c.profile.owner_id.is_none()).map(|c| c.profile.id);
+        self.modal = Some(Modal::ListItemForm(ListItemDraft { list_id, match_id, note: String::new() }));
     }
 
     pub fn open_new_tag(&mut self) {
@@ -858,13 +1006,15 @@ impl AppState {
             Tab::Stats => None,
         };
         match target {
-            Some(t) => self.modal = Some(Modal::ConfirmDelete(t)),
+            Some(t) => self.open_delete(t),
             None => self.error("No hay nada seleccionado para borrar"),
         }
     }
 
     pub fn open_delete(&mut self, target: DeleteTarget) {
-        self.modal = Some(Modal::ConfirmDelete(target));
+        if !self.deny_foreign(self.target_owner(target)) {
+            self.modal = Some(Modal::ConfirmDelete(target));
+        }
     }
 
     pub fn close_modal(&mut self) {
@@ -892,6 +1042,10 @@ impl AppState {
             DeleteTarget::ListItem { match_id, .. } => format!(
                 "¿Quitar a «{}» de la lista?",
                 self.card(match_id).map(|c| c.profile.alias.as_str()).unwrap_or("?")
+            ),
+            DeleteTarget::Owner(id) => format!(
+                "¿Borrar el perfil «{}» con todo lo importado (matches, reseñas, listas y fotos)?",
+                self.owner_name(Some(id))
             ),
         }
     }
@@ -929,7 +1083,9 @@ impl AppState {
                 };
                 let previous = draft.editing_id.and_then(|id| self.card(id)).map(|c| c.profile.clone());
                 let was_favorite = previous.as_ref().is_some_and(|p| p.is_favorite);
-                if profile.is_favorite && !was_favorite && self.favorites().len() >= MAX_FAVORITES {
+                let own_favorites =
+                    self.cards.iter().filter(|c| c.profile.owner_id.is_none() && c.profile.is_favorite).count();
+                if profile.is_favorite && !was_favorite && own_favorites >= MAX_FAVORITES {
                     return Ok(Err(format!("El Top {MAX_FAVORITES} está lleno")));
                 }
                 // Una foto elegida fuera de la carpeta de la app se copia dentro.
@@ -970,6 +1126,9 @@ impl AppState {
                     Ok(l) => l,
                     Err(e) => return Ok(Err(e)),
                 };
+                if self.card(log.match_id).is_some_and(|c| c.profile.owner_id.is_some()) {
+                    return Ok(Err("Sólo puedes reseñar tus propios matches".to_string()));
+                }
                 let id = match draft.editing_id {
                     Some(_) => {
                         db.update_log(&log)?;
@@ -1000,6 +1159,9 @@ impl AppState {
                 let Some(match_id) = draft.match_id else {
                     return Ok(Err("Elige un match para añadir a la lista".to_string()));
                 };
+                if self.card(match_id).is_some_and(|c| c.profile.owner_id.is_some()) {
+                    return Ok(Err("Sólo puedes añadir tus propios matches a tus listas".to_string()));
+                }
                 let note = non_empty(&draft.note);
                 db.add_list_item(draft.list_id, match_id, note.as_deref())?;
                 "Match añadido a la lista".to_string()
@@ -1021,7 +1183,13 @@ impl AppState {
                 }
                 // Un archivo inválido es un error de validación: el formulario sigue abierto.
                 match export::import_file(db, Path::new(path), &draft.options()) {
-                    Ok(report) => report.summary(),
+                    Ok(report) => {
+                        // Mostrar directamente el perfil importado, sin mezclarlo con lo tuyo.
+                        if let Some(owner) = &report.owner {
+                            self.show_owner_after_change(OwnerFilter::Owner(owner.id));
+                        }
+                        report.summary()
+                    }
                     Err(e) => return Ok(Err(format!("{e:#}"))),
                 }
             }
@@ -1040,22 +1208,35 @@ impl AppState {
                     DeleteTarget::ListItem { list_id, match_id } => {
                         db.remove_list_item(list_id, match_id)?
                     }
+                    DeleteTarget::Owner(id) => {
+                        db.delete_owner(id)?;
+                        self.show_owner_after_change(OwnerFilter::Mine);
+                    }
                 }
                 format!("Hecho: {}", msg.trim_start_matches('¿').trim_end_matches('?'))
             }
         }))
     }
 
+    /// Cambia el filtro antes del `refresh` que sigue a un modal (importar, borrar perfil).
+    fn show_owner_after_change(&mut self, filter: OwnerFilter) {
+        self.owner_filter = filter;
+        self.selected_match = None;
+        self.selected_log = None;
+        self.selected_list = None;
+        self.cursors = Default::default();
+    }
+
     // ------------------------------------------------------ exportar / importar
 
-    /// Qué exportar según la pestaña: el match o la lista seleccionados; si no, todo.
+    /// Qué exportar según la pestaña: el match o la lista seleccionados; si no, todo
+    /// lo del perfil que se está viendo.
     pub fn export_target(&self) -> ExportTarget {
+        let all = ExportTarget::All(self.owner_filter);
         match self.active_tab {
-            Tab::Cartelera | Tab::Watchlist => {
-                self.selected_match.map(ExportTarget::Match).unwrap_or(ExportTarget::All)
-            }
-            Tab::Lists => self.selected_list.map(ExportTarget::List).unwrap_or(ExportTarget::All),
-            _ => ExportTarget::All,
+            Tab::Cartelera | Tab::Watchlist => self.selected_match.map(ExportTarget::Match).unwrap_or(all),
+            Tab::Lists => self.selected_list.map(ExportTarget::List).unwrap_or(all),
+            _ => all,
         }
     }
 
@@ -1092,7 +1273,11 @@ impl AppState {
             self.error("Selecciona un match");
             return Ok(());
         };
-        let (id, fav, alias) = (card.profile.id, !card.profile.is_favorite, card.profile.alias.clone());
+        let (id, fav, alias, owner) =
+            (card.profile.id, !card.profile.is_favorite, card.profile.alias.clone(), card.profile.owner_id);
+        if self.deny_foreign(owner) {
+            return Ok(());
+        }
         match db.set_favorite(id, fav) {
             Ok(()) => {
                 self.refresh(db)?;
@@ -1113,7 +1298,10 @@ impl AppState {
             self.error("Selecciona un match");
             return Ok(());
         };
-        let (id, next) = (card.profile.id, card.profile.status.next());
+        let (id, next, owner) = (card.profile.id, card.profile.status.next(), card.profile.owner_id);
+        if self.deny_foreign(owner) {
+            return Ok(());
+        }
         db.set_status(id, next)?;
         self.refresh(db)?;
         self.info(format!("Nuevo estado: {next}"));
@@ -1123,6 +1311,9 @@ impl AppState {
     /// Mueve el item del match seleccionado dentro de la lista seleccionada.
     pub fn move_list_item(&mut self, db: &Database, match_id: i64, up: bool) -> Result<()> {
         let Some(list_id) = self.selected_list else { return Ok(()) };
+        if self.deny_foreign(self.list_owner(list_id)) {
+            return Ok(());
+        }
         db.move_list_item(list_id, match_id, up)?;
         self.refresh(db)
     }
@@ -1220,10 +1411,10 @@ mod tests {
         st.set_tab(Tab::Lists);
         assert!(matches!(st.export_target(), ExportTarget::List(_)));
         st.set_tab(Tab::Stats);
-        assert_eq!(st.export_target(), ExportTarget::All);
+        assert_eq!(st.export_target(), ExportTarget::All(OwnerFilter::Mine));
 
         let path = std::env::temp_dir().join(format!("tinderboxd_state_export_{}.json", std::process::id()));
-        st.export_to(&db, ExportTarget::All, &path, ExportOptions::default()).unwrap();
+        st.export_to(&db, ExportTarget::All(OwnerFilter::Mine), &path, ExportOptions::default()).unwrap();
         assert!(st.status.as_ref().unwrap().text.contains("4 matches"));
 
         let dst = Database::open_in_memory().unwrap();
@@ -1242,6 +1433,55 @@ mod tests {
         assert!(other.modal.is_some());
         assert!(other.status.as_ref().unwrap().is_error);
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn imported_profiles_are_separate_and_read_only() {
+        let (db, mut st) = state();
+        let path = std::env::temp_dir().join(format!("tinderboxd_state_owner_{}.json", std::process::id()));
+        st.export_to(&db, ExportTarget::All(OwnerFilter::Mine), &path, ExportOptions::default()).unwrap();
+
+        // Importar en el perfil «Ana» lleva directamente a verlo, con sus propias stats.
+        st.open_import(Some(path.display().to_string()));
+        if let Some(Modal::ImportForm(d)) = &mut st.modal {
+            d.owner_name = "Ana".into();
+        }
+        st.submit_modal(&db).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert!(st.modal.is_none(), "{:?}", st.status);
+        assert!(st.is_read_only_view());
+        assert_eq!(st.filter_label(), "Ana");
+        assert_eq!(st.cards.len(), 4);
+        assert_eq!(st.stats.total_logs, 7);
+
+        // Nada de Ana se puede crear, editar, marcar ni borrar.
+        st.set_tab(Tab::Cartelera);
+        for action in [AppState::open_new_match, AppState::open_edit_selected_match, AppState::open_new_review] {
+            action(&mut st);
+            assert!(st.modal.is_none());
+            assert!(st.status.as_ref().unwrap().is_error);
+        }
+        st.open_delete_selected();
+        assert!(st.modal.is_none());
+        st.toggle_favorite_selected(&db).unwrap();
+        assert!(st.status.as_ref().unwrap().text.contains("sólo lectura"));
+
+        // Ciclo de perfiles: Ana → Todos → Tú.
+        st.cycle_owner_filter(&db).unwrap();
+        assert_eq!(st.owner_filter, OwnerFilter::All);
+        assert_eq!(st.cards.len(), 8);
+        st.cycle_owner_filter(&db).unwrap();
+        assert_eq!(st.owner_filter, OwnerFilter::Mine);
+        assert_eq!(st.stats.total_matches, 4, "tus estadísticas no incluyen a Ana");
+
+        // Borrar el perfil quita todo lo suyo y vuelve a «Tú».
+        let ana = st.owners[0].id;
+        st.set_owner_filter(&db, OwnerFilter::Owner(ana)).unwrap();
+        st.open_delete_owner();
+        st.submit_modal(&db).unwrap();
+        assert!(st.owners.is_empty());
+        assert_eq!(st.owner_filter, OwnerFilter::Mine);
+        assert_eq!(db.list_matches(OwnerFilter::All).unwrap().len(), 4);
     }
 
     #[test]

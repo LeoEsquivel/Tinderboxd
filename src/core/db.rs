@@ -35,9 +35,10 @@ pub const PHOTOS_DIR: &str = "tinderboxd_fotos";
 /// Extensiones de imagen aceptadas para las fotos.
 pub const PHOTO_EXTENSIONS: &[&str] = &["png", "jpg", "jpeg", "webp"];
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
-const SCHEMA: &str = r#"
+/// v1: esquema del Punto 4 de AGENT.md.
+const SCHEMA_V1: &str = r#"
 CREATE TABLE IF NOT EXISTS matches (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     alias         TEXT    NOT NULL,
@@ -94,6 +95,29 @@ CREATE TABLE IF NOT EXISTS list_items (
 );
 "#;
 
+/// v2: dueños de datos importados. `owner_id = NULL` son tus datos; borrar un
+/// dueño borra en cascada sus matches (con sus logs) y sus listas.
+const MIGRATION_V2: &str = r#"
+CREATE TABLE IF NOT EXISTS owners (
+    id   INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL UNIQUE COLLATE NOCASE
+);
+ALTER TABLE matches ADD COLUMN owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE;
+ALTER TABLE lists   ADD COLUMN owner_id INTEGER REFERENCES owners(id) ON DELETE CASCADE;
+CREATE INDEX IF NOT EXISTS idx_matches_owner ON matches(owner_id);
+CREATE INDEX IF NOT EXISTS idx_lists_owner   ON lists(owner_id);
+"#;
+
+/// Condición SQL de un `OwnerFilter` sobre la columna `col`. El id es un entero
+/// nuestro, así que interpolarlo es seguro.
+fn owner_sql(col: &str, filter: OwnerFilter) -> String {
+    match filter {
+        OwnerFilter::Mine => format!("{col} IS NULL"),
+        OwnerFilter::Owner(id) => format!("{col} = {id}"),
+        OwnerFilter::All => "1 = 1".to_string(),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ToSql / FromSql para los tipos de dominio
 // ---------------------------------------------------------------------------
@@ -139,8 +163,13 @@ impl FromSql for Rating {
 // Mapeo de filas
 // ---------------------------------------------------------------------------
 
-const MATCH_COLS: &str =
-    "m.id, m.alias, m.age, m.platform, m.bio_highlight, m.avatar_path, m.match_date, m.status, m.is_favorite";
+const MATCH_COLS: &str = "m.id, m.alias, m.age, m.platform, m.bio_highlight, m.avatar_path, m.match_date, \
+     m.status, m.is_favorite, m.owner_id";
+
+/// Número de columnas de `MATCH_COLS` (para leer lo que viene detrás).
+const MATCH_NCOLS: usize = 10;
+
+const LIST_COLS: &str = "l.id, l.title, l.description, l.is_ranked, l.owner_id";
 
 const LOG_COLS: &str = "l.id, l.match_id, l.interaction_type, l.date_logged, l.rating, l.script_score, \
      l.cinematography_score, l.direction_score, l.liked, l.review_text, l.contains_spoilers";
@@ -157,6 +186,7 @@ fn match_from_row(row: &Row<'_>, o: usize) -> rusqlite::Result<MatchProfile> {
         match_date: row.get(o + 6)?,
         status: row.get(o + 7)?,
         is_favorite: row.get(o + 8)?,
+        owner_id: row.get(o + 9)?,
     })
 }
 
@@ -187,6 +217,7 @@ fn list_from_row(row: &Row<'_>) -> rusqlite::Result<CustomList> {
         title: row.get(1)?,
         description: row.get(2)?,
         is_ranked: row.get(3)?,
+        owner_id: row.get(4)?,
     })
 }
 
@@ -336,9 +367,53 @@ impl Database {
 
     fn migrate(&self) -> Result<()> {
         let version: i64 = self.conn.query_row("PRAGMA user_version", [], |r| r.get(0))?;
-        if version < SCHEMA_VERSION {
-            self.conn.execute_batch(SCHEMA).context("error creando el esquema")?;
-            self.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+        if version >= SCHEMA_VERSION {
+            return Ok(());
+        }
+        self.transaction(|db| {
+            if version < 1 {
+                db.conn.execute_batch(SCHEMA_V1).context("error creando el esquema")?;
+            }
+            if version < 2 {
+                db.conn.execute_batch(MIGRATION_V2).context("error migrando a la versión 2")?;
+            }
+            db.conn.execute_batch(&format!("PRAGMA user_version = {SCHEMA_VERSION};"))?;
+            Ok(())
+        })
+    }
+
+    // ------------------------------------------------------------------ dueños
+
+    pub fn list_owners(&self) -> Result<Vec<Owner>> {
+        let mut stmt = self.conn.prepare("SELECT id, name FROM owners ORDER BY name COLLATE NOCASE")?;
+        let rows = stmt.query_map([], |r| Ok(Owner { id: r.get(0)?, name: r.get(1)? }))?;
+        Ok(rows.collect::<rusqlite::Result<_>>()?)
+    }
+
+    /// Id del dueño con ese nombre (sin distinguir mayúsculas), creándolo si no existe.
+    pub fn get_or_create_owner(&self, name: &str) -> Result<i64> {
+        let name = name.trim();
+        if name.is_empty() {
+            bail!("el perfil necesita un nombre");
+        }
+        let existing: Option<i64> = self
+            .conn
+            .query_row("SELECT id FROM owners WHERE name = ?1", [name], |r| r.get(0))
+            .optional()?;
+        if let Some(id) = existing {
+            return Ok(id);
+        }
+        self.conn.execute("INSERT INTO owners (name) VALUES (?1)", [name])?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Borra un dueño y, en cascada, todo lo importado de él (también sus fotos).
+    pub fn delete_owner(&self, id: i64) -> Result<()> {
+        let photos: Vec<String> =
+            self.list_matches(OwnerFilter::Owner(id))?.into_iter().filter_map(|m| m.avatar_path).collect();
+        self.conn.execute("DELETE FROM owners WHERE id = ?1", [id])?;
+        for photo in photos {
+            self.remove_photo(&photo);
         }
         Ok(())
     }
@@ -347,8 +422,9 @@ impl Database {
 
     pub fn insert_match(&self, m: &MatchProfile) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO matches (alias, age, platform, bio_highlight, avatar_path, match_date, status, is_favorite)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            "INSERT INTO matches (alias, age, platform, bio_highlight, avatar_path, match_date, status,
+                                  is_favorite, owner_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 m.alias,
                 m.age,
@@ -357,7 +433,8 @@ impl Database {
                 self.stored_photo(&m.avatar_path),
                 m.match_date,
                 m.status,
-                m.is_favorite
+                m.is_favorite,
+                m.owner_id
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -397,33 +474,38 @@ impl Database {
         Ok(self.conn.query_row(&sql, [id], |r| self.match_row(r, 0)).optional()?)
     }
 
-    /// Todos los matches, los más recientes primero.
-    pub fn list_matches(&self) -> Result<Vec<MatchProfile>> {
+    /// Matches del filtro, los más recientes primero.
+    pub fn list_matches(&self, filter: OwnerFilter) -> Result<Vec<MatchProfile>> {
         let sql = format!(
-            "SELECT {MATCH_COLS} FROM matches m ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC"
+            "SELECT {MATCH_COLS} FROM matches m WHERE {}
+             ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC",
+            owner_sql("m.owner_id", filter)
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| self.match_row(r, 0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-
-    /// El "Top 4" del perfil.
-    pub fn favorites(&self) -> Result<Vec<MatchProfile>> {
+    /// El "Top 4" del perfil (cada dueño tiene el suyo).
+    pub fn favorites(&self, filter: OwnerFilter) -> Result<Vec<MatchProfile>> {
         let sql = format!(
-            "SELECT {MATCH_COLS} FROM matches m WHERE m.is_favorite = 1 ORDER BY m.id LIMIT {MAX_FAVORITES}"
+            "SELECT {MATCH_COLS} FROM matches m WHERE m.is_favorite = 1 AND {}
+             ORDER BY m.id LIMIT {MAX_FAVORITES}",
+            owner_sql("m.owner_id", filter)
         );
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], |r| self.match_row(r, 0))?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Marca/desmarca favorito respetando el límite del Top 4.
+    /// Marca/desmarca favorito respetando el límite del Top 4 de su dueño.
     pub fn set_favorite(&self, match_id: i64, favorite: bool) -> Result<()> {
         if favorite {
+            // `IS` compara también NULL = NULL (tus propios matches).
             let (already, count): (bool, i64) = self.conn.query_row(
                 "SELECT COALESCE((SELECT is_favorite FROM matches WHERE id = ?1), 0),
-                        (SELECT COUNT(*) FROM matches WHERE is_favorite = 1)",
+                        (SELECT COUNT(*) FROM matches WHERE is_favorite = 1
+                           AND owner_id IS (SELECT owner_id FROM matches WHERE id = ?1))",
                 [match_id],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )?;
@@ -447,7 +529,7 @@ impl Database {
     }
 
     /// Tarjetas de matches con agregados y tags, ordenadas por fecha de match.
-    pub fn match_cards(&self) -> Result<Vec<MatchCard>> {
+    pub fn match_cards(&self, filter: OwnerFilter) -> Result<Vec<MatchCard>> {
         let sql = format!(
             "SELECT {MATCH_COLS},
                     COUNT(l.id),
@@ -458,19 +540,22 @@ impl Database {
                       ORDER BY l2.date_logged DESC, l2.id DESC LIMIT 1)
              FROM matches m
              LEFT JOIN logs l ON l.match_id = m.id
+             WHERE {}
              GROUP BY m.id
-             ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC"
+             ORDER BY m.match_date IS NULL, m.match_date DESC, m.id DESC",
+            owner_sql("m.owner_id", filter)
         );
         let mut tags_by_match = self.tags_by_match()?;
         let mut stmt = self.conn.prepare(&sql)?;
+        let o = MATCH_NCOLS;
         let rows = stmt.query_map([], |r| {
             Ok(MatchCard {
                 profile: self.match_row(r, 0)?,
-                log_count: r.get(9)?,
-                avg_rating: r.get(10)?,
-                liked: r.get(11)?,
-                last_logged: r.get(12)?,
-                last_rating: r.get(13)?,
+                log_count: r.get(o)?,
+                avg_rating: r.get(o + 1)?,
+                liked: r.get(o + 2)?,
+                last_logged: r.get(o + 3)?,
+                last_rating: r.get(o + 4)?,
                 tags: Vec::new(),
             })
         })?;
@@ -537,18 +622,25 @@ impl Database {
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
 
-    /// Diary: todas las interacciones, las más recientes primero. `limit = None` → todas.
-    pub fn diary(&self, limit: Option<u32>) -> Result<Vec<DiaryEntry>> {
+    /// Diary: interacciones del filtro, las más recientes primero. `limit = None` → todas.
+    pub fn diary(&self, limit: Option<u32>, filter: OwnerFilter) -> Result<Vec<DiaryEntry>> {
         let sql = format!(
-            "SELECT {LOG_COLS}, m.alias, m.platform
+            "SELECT {LOG_COLS}, m.alias, m.platform, m.owner_id
              FROM logs l JOIN matches m ON m.id = l.match_id
+             WHERE {}
              ORDER BY l.date_logged DESC, l.id DESC
-             LIMIT ?1"
+             LIMIT ?1",
+            owner_sql("m.owner_id", filter)
         );
         let limit = limit.map(i64::from).unwrap_or(-1);
         let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([limit], |r| {
-            Ok(DiaryEntry { log: log_from_row(r, 0)?, match_alias: r.get(11)?, platform: r.get(12)? })
+            Ok(DiaryEntry {
+                log: log_from_row(r, 0)?,
+                match_alias: r.get(11)?,
+                platform: r.get(12)?,
+                owner_id: r.get(13)?,
+            })
         })?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -632,8 +724,8 @@ impl Database {
             bail!("la lista necesita un título");
         }
         self.conn.execute(
-            "INSERT INTO lists (title, description, is_ranked) VALUES (?1, ?2, ?3)",
-            params![list.title.trim(), list.description, list.is_ranked],
+            "INSERT INTO lists (title, description, is_ranked, owner_id) VALUES (?1, ?2, ?3, ?4)",
+            params![list.title.trim(), list.description, list.is_ranked, list.owner_id],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -655,19 +747,14 @@ impl Database {
     }
 
     pub fn get_list(&self, id: i64) -> Result<Option<CustomList>> {
-        Ok(self
-            .conn
-            .query_row(
-                "SELECT id, title, description, is_ranked FROM lists WHERE id = ?1",
-                [id],
-                list_from_row,
-            )
-            .optional()?)
+        let sql = format!("SELECT {LIST_COLS} FROM lists l WHERE l.id = ?1");
+        Ok(self.conn.query_row(&sql, [id], list_from_row).optional()?)
     }
 
-    pub fn list_lists(&self) -> Result<Vec<CustomList>> {
-        let mut stmt =
-            self.conn.prepare("SELECT id, title, description, is_ranked FROM lists ORDER BY id")?;
+    pub fn list_lists(&self, filter: OwnerFilter) -> Result<Vec<CustomList>> {
+        let sql =
+            format!("SELECT {LIST_COLS} FROM lists l WHERE {} ORDER BY l.id", owner_sql("l.owner_id", filter));
+        let mut stmt = self.conn.prepare(&sql)?;
         let rows = stmt.query_map([], list_from_row)?;
         Ok(rows.collect::<rusqlite::Result<_>>()?)
     }
@@ -748,17 +835,22 @@ impl Database {
 
     // ------------------------------------------------------------------- stats
 
-    pub fn stats(&self) -> Result<StatsSummary> {
+    /// Estadísticas sólo de los datos del filtro: nunca se mezclan perfiles salvo en `All`.
+    pub fn stats(&self, filter: OwnerFilter) -> Result<StatsSummary> {
         let mut s = StatsSummary::default();
+        let own = owner_sql("m.owner_id", filter);
 
         // Totales.
         let (total_matches, total_logs, liked_logs, avg): (u32, u32, u32, Option<f64>) =
             self.conn.query_row(
-                "SELECT (SELECT COUNT(*) FROM matches),
-                        COUNT(*),
-                        COALESCE(SUM(liked), 0),
-                        AVG(rating)
-                 FROM logs",
+                &format!(
+                    "SELECT (SELECT COUNT(*) FROM matches m WHERE {own}),
+                            COUNT(*),
+                            COALESCE(SUM(l.liked), 0),
+                            AVG(l.rating)
+                     FROM logs l JOIN matches m ON m.id = l.match_id
+                     WHERE {own}"
+                ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
             )?;
@@ -768,7 +860,10 @@ impl Database {
         s.average_rating = avg;
 
         // Distribución de estrellas (1..=10 medias estrellas).
-        let mut stmt = self.conn.prepare("SELECT rating, COUNT(*) FROM logs GROUP BY rating")?;
+        let mut stmt = self.conn.prepare(&format!(
+            "SELECT l.rating, COUNT(*) FROM logs l JOIN matches m ON m.id = l.match_id
+             WHERE {own} GROUP BY l.rating"
+        ))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, Rating>(0)?, r.get::<_, u32>(1)?)))?;
         for row in rows {
             let (rating, count) = row?;
@@ -777,7 +872,8 @@ impl Database {
 
         // Conteo por estado.
         let mut by_status: HashMap<MatchStatus, u32> = HashMap::new();
-        let mut stmt = self.conn.prepare("SELECT status, COUNT(*) FROM matches GROUP BY status")?;
+        let mut stmt =
+            self.conn.prepare(&format!("SELECT m.status, COUNT(*) FROM matches m WHERE {own} GROUP BY m.status"))?;
         let rows = stmt.query_map([], |r| Ok((r.get::<_, MatchStatus>(0)?, r.get::<_, u32>(1)?)))?;
         for row in rows {
             let (status, count) = row?;
@@ -789,23 +885,26 @@ impl Database {
         // Embudo: etapa máxima alcanzada por cada match según sus interacciones.
         let (total, chat, call, first_date, casual, ghosted_after_chat): (u32, u32, u32, u32, u32, u32) =
             self.conn.query_row(
-                "WITH reach AS (
-                     SELECT m.id, m.status,
-                            COALESCE(MAX(CASE l.interaction_type
-                                WHEN 'Chat'         THEN 1
-                                WHEN 'Llamada'      THEN 2
-                                WHEN 'Primera Cita' THEN 3
-                                WHEN 'Cita Casual'  THEN 4 END), 0) AS stage
-                     FROM matches m LEFT JOIN logs l ON l.match_id = m.id
-                     GROUP BY m.id
-                 )
-                 SELECT COUNT(*),
-                        COALESCE(SUM(stage >= 1), 0),
-                        COALESCE(SUM(stage >= 2), 0),
-                        COALESCE(SUM(stage >= 3), 0),
-                        COALESCE(SUM(stage >= 4), 0),
-                        COALESCE(SUM(stage >= 1 AND status IN ('Ghosteado', 'Ghosting Mutuo')), 0)
-                 FROM reach",
+                &format!(
+                    "WITH reach AS (
+                         SELECT m.id, m.status,
+                                COALESCE(MAX(CASE l.interaction_type
+                                    WHEN 'Chat'         THEN 1
+                                    WHEN 'Llamada'      THEN 2
+                                    WHEN 'Primera Cita' THEN 3
+                                    WHEN 'Cita Casual'  THEN 4 END), 0) AS stage
+                         FROM matches m LEFT JOIN logs l ON l.match_id = m.id
+                         WHERE {own}
+                         GROUP BY m.id
+                     )
+                     SELECT COUNT(*),
+                            COALESCE(SUM(stage >= 1), 0),
+                            COALESCE(SUM(stage >= 2), 0),
+                            COALESCE(SUM(stage >= 3), 0),
+                            COALESCE(SUM(stage >= 4), 0),
+                            COALESCE(SUM(stage >= 1 AND status IN ('Ghosteado', 'Ghosting Mutuo')), 0)
+                     FROM reach"
+                ),
                 [],
                 |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?, r.get(5)?)),
             )?;
@@ -827,22 +926,25 @@ impl Database {
         s.ghosting_pct = pct(ghosted_after_chat, chat);
 
         // Top flags.
-        s.top_red_flags = self.top_tags(TagCategory::RedFlag, 5)?;
-        s.top_green_flags = self.top_tags(TagCategory::GreenFlag, 5)?;
+        s.top_red_flags = self.top_tags(TagCategory::RedFlag, 5, filter)?;
+        s.top_green_flags = self.top_tags(TagCategory::GreenFlag, 5, filter)?;
 
         Ok(s)
     }
 
-    /// Tags de una categoría ordenados por número de matches que los tienen.
-    pub fn top_tags(&self, category: TagCategory, limit: u32) -> Result<Vec<TagCount>> {
-        let mut stmt = self.conn.prepare(
+    /// Tags de una categoría ordenados por número de matches (del filtro) que los tienen.
+    pub fn top_tags(&self, category: TagCategory, limit: u32, filter: OwnerFilter) -> Result<Vec<TagCount>> {
+        let mut stmt = self.conn.prepare(&format!(
             "SELECT t.id, t.name, t.category, COUNT(mt.match_id) AS c
-             FROM tags t JOIN match_tags mt ON mt.tag_id = t.id
-             WHERE t.category = ?1
+             FROM tags t
+             JOIN match_tags mt ON mt.tag_id = t.id
+             JOIN matches m ON m.id = mt.match_id
+             WHERE t.category = ?1 AND {}
              GROUP BY t.id
              ORDER BY c DESC, t.name
              LIMIT ?2",
-        )?;
+            owner_sql("m.owner_id", filter)
+        ))?;
         let rows = stmt.query_map(params![category, limit], |r| {
             Ok(TagCount { tag: tag_from_row(r, 0)?, count: r.get(3)? })
         })?;
@@ -1050,6 +1152,7 @@ fn seed(db: &Database) -> Result<()> {
             match_date: Some(date(sm.date)),
             status: sm.status,
             is_favorite: sm.favorite,
+            owner_id: None,
         };
         let match_id = db.insert_match(&profile)?;
         match_ids.insert(sm.alias, match_id);
@@ -1085,6 +1188,7 @@ fn seed(db: &Database) -> Result<()> {
                 .to_string(),
         ),
         is_ranked: true,
+        owner_id: None,
     })?;
     for (alias, note) in [
         ("Crypto Bro de Polanco", "Me mandó su pitch deck en lugar de su Instagram."),
@@ -1111,9 +1215,9 @@ mod tests {
     fn seed_is_idempotent() {
         let db = seeded();
         assert!(!db.seed_if_empty().unwrap());
-        assert_eq!(db.list_matches().unwrap().len(), 4);
-        assert_eq!(db.diary(None).unwrap().len(), 7);
-        assert_eq!(db.list_lists().unwrap().len(), 1);
+        assert_eq!(db.list_matches(OwnerFilter::Mine).unwrap().len(), 4);
+        assert_eq!(db.diary(None, OwnerFilter::Mine).unwrap().len(), 7);
+        assert_eq!(db.list_lists(OwnerFilter::Mine).unwrap().len(), 1);
     }
 
     #[test]
@@ -1181,9 +1285,81 @@ mod tests {
     }
 
     #[test]
+    fn owners_keep_data_and_stats_separate() {
+        let db = seeded();
+        let ana = db.get_or_create_owner("Ana").unwrap();
+        assert_eq!(db.get_or_create_owner("  ana ").unwrap(), ana, "sin distinguir mayúsculas");
+
+        let mut m = MatchProfile::new("El de Ana", Platform::Bumble, MatchStatus::Activa);
+        m.owner_id = Some(ana);
+        m.is_favorite = true;
+        let id = db.insert_match(&m).unwrap();
+        db.insert_log(&InteractionLog {
+            id: 0,
+            match_id: id,
+            interaction_type: InteractionType::PrimeraCita,
+            date_logged: date("2026-10-01"),
+            rating: Rating::new(10).unwrap(),
+            script_score: None,
+            cinematography_score: None,
+            direction_score: None,
+            liked: true,
+            review_text: None,
+            contains_spoilers: false,
+        })
+        .unwrap();
+        let tag = db.get_or_create_tag("Puntual", TagCategory::GreenFlag).unwrap();
+        db.add_tag_to_match(id, tag).unwrap();
+
+        // Tus estadísticas no cambian; las de Ana sólo ven lo suyo.
+        let mine = db.stats(OwnerFilter::Mine).unwrap();
+        assert_eq!((mine.total_matches, mine.total_logs), (4, 7));
+        assert_eq!(mine.rating_distribution[9], 0);
+        let hers = db.stats(OwnerFilter::Owner(ana)).unwrap();
+        assert_eq!((hers.total_matches, hers.total_logs), (1, 1));
+        assert_eq!(hers.rating_distribution[9], 1);
+        assert_eq!(hers.top_green_flags[0].count, 1);
+        assert_eq!(db.stats(OwnerFilter::All).unwrap().total_matches, 5);
+
+        // Cada dueño tiene su Top 4.
+        assert_eq!(db.favorites(OwnerFilter::Mine).unwrap().len(), 2);
+        assert_eq!(db.favorites(OwnerFilter::Owner(ana)).unwrap().len(), 1);
+        assert_eq!(db.diary(None, OwnerFilter::Owner(ana)).unwrap()[0].owner_id, Some(ana));
+
+        // Borrar a Ana borra lo suyo en cascada y nada tuyo.
+        db.delete_owner(ana).unwrap();
+        assert!(db.get_match(id).unwrap().is_none());
+        assert_eq!(db.list_matches(OwnerFilter::All).unwrap().len(), 4);
+        assert!(db.list_owners().unwrap().is_empty());
+    }
+
+    #[test]
+    fn migrates_v1_database() {
+        // Una BD creada con el esquema v1 (sin owners) se actualiza al abrirla.
+        let path = std::env::temp_dir().join(format!("tinderboxd_v1_{}.db", std::process::id()));
+        let _ = fs::remove_file(&path);
+        {
+            let conn = Connection::open(&path).unwrap();
+            conn.execute_batch(SCHEMA_V1).unwrap();
+            conn.execute_batch(
+                "PRAGMA user_version = 1;
+                 INSERT INTO matches (alias, platform, status) VALUES ('Antiguo', 'Tinder', 'Activa');",
+            )
+            .unwrap();
+        }
+        let db = Database::open(&path).unwrap();
+        let all = db.list_matches(OwnerFilter::Mine).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].owner_id, None, "lo que ya había es tuyo");
+        db.get_or_create_owner("Ana").unwrap();
+        drop(db);
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
     fn invalid_sub_score_is_rejected() {
         let db = seeded();
-        let mut log = db.diary(Some(1)).unwrap().remove(0).log;
+        let mut log = db.diary(Some(1), OwnerFilter::Mine).unwrap().remove(0).log;
         log.script_score = Some(9);
         assert!(db.update_log(&log).is_err());
     }
@@ -1191,19 +1367,19 @@ mod tests {
     #[test]
     fn favorites_capped_at_four() {
         let db = seeded();
-        let ids: Vec<i64> = db.list_matches().unwrap().iter().map(|m| m.id).collect();
+        let ids: Vec<i64> = db.list_matches(OwnerFilter::Mine).unwrap().iter().map(|m| m.id).collect();
         for id in &ids {
             db.set_favorite(*id, true).unwrap();
         }
         let extra = db.insert_match(&MatchProfile::new("Quinto", Platform::Tinder, MatchStatus::Activa)).unwrap();
         assert!(db.set_favorite(extra, true).is_err());
-        assert_eq!(db.favorites().unwrap().len(), 4);
+        assert_eq!(db.favorites(OwnerFilter::Mine).unwrap().len(), 4);
     }
 
     #[test]
     fn stats_from_seed() {
         let db = seeded();
-        let s = db.stats().unwrap();
+        let s = db.stats(OwnerFilter::Mine).unwrap();
         assert_eq!(s.total_matches, 4);
         assert_eq!(s.total_logs, 7);
         assert_eq!(s.rating_distribution.iter().sum::<u32>(), 7);
@@ -1219,7 +1395,7 @@ mod tests {
     #[test]
     fn list_reordering() {
         let db = seeded();
-        let list = db.list_lists().unwrap().remove(0);
+        let list = db.list_lists(OwnerFilter::Mine).unwrap().remove(0);
         let before = db.list_entries(list.id).unwrap();
         let second = before[1].item.match_id;
         db.move_list_item(list.id, second, true).unwrap();
@@ -1233,7 +1409,7 @@ mod tests {
     #[test]
     fn cards_aggregate_logs_and_tags() {
         let db = seeded();
-        let cards = db.match_cards().unwrap();
+        let cards = db.match_cards(OwnerFilter::Mine).unwrap();
         let perro = cards.iter().find(|c| c.profile.alias.contains("perro")).unwrap();
         assert_eq!(perro.log_count, 3);
         assert!(perro.liked);

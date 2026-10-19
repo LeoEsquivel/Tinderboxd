@@ -11,8 +11,8 @@ use eframe::egui::{
 
 use crate::core::db::{MAX_FAVORITES, PHOTO_EXTENSIONS};
 use crate::core::models::{
-    DiaryEntry, InteractionLog, MatchCard, MatchProfile, MatchStatus, Platform, StatsSummary, Tag,
-    TagCategory, format_stars,
+    DiaryEntry, InteractionLog, MatchCard, MatchProfile, MatchStatus, Owner, OwnerFilter, Platform,
+    StatsSummary, Tag, TagCategory, format_stars,
 };
 use crate::core::export::ExportTarget;
 use crate::core::state::{
@@ -312,7 +312,12 @@ fn paint_poster(ui: &Ui, rect: Rect, p: &MatchProfile) {
 }
 
 /// Póster con pie (alias, estrellas, corazón) para la cuadrícula.
-fn poster_tile(ui: &mut Ui, card: &MatchCard, selected: bool) -> Response {
+/// En la vista «Todos», de quién es un dato importado (lo tuyo no se etiqueta).
+fn owner_tag(app: &GuiApp, owner_id: Option<i64>) -> Option<String> {
+    (app.state.owner_filter == OwnerFilter::All && owner_id.is_some()).then(|| app.state.owner_name(owner_id))
+}
+
+fn poster_tile(ui: &mut Ui, card: &MatchCard, selected: bool, owner: Option<String>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(POSTER.x, POSTER.y + 44.0), Sense::click());
     let poster = Rect::from_min_size(rect.min, POSTER);
     paint_poster(ui, poster, &card.profile);
@@ -320,6 +325,12 @@ fn poster_tile(ui: &mut Ui, card: &MatchCard, selected: bool) -> Response {
     let painter = ui.painter();
     if card.profile.is_favorite {
         painter.text(poster.right_top() + vec2(-8.0, 6.0), Align2::RIGHT_TOP, "◆", FontId::proportional(15.0), BLUE);
+    }
+    if let Some(name) = owner {
+        let text = truncate(&name, 14);
+        let badge = Rect::from_min_size(poster.min + vec2(6.0, 6.0), vec2(8.0 + text.chars().count() as f32 * 7.0, 20.0));
+        painter.rect_filled(badge, CornerRadius::same(4), Color32::from_black_alpha(190));
+        painter.text(badge.center(), Align2::CENTER_CENTER, text, FontId::proportional(12.0), ORANGE);
     }
     let stroke = if selected {
         Some(Stroke::new(3.0, GREEN))
@@ -435,8 +446,9 @@ fn form_label(ui: &mut Ui, text: &str) {
 pub fn header(ui: &mut Ui, app: &mut GuiApp) {
     // Algunos gestores de ventanas ignoran el tamaño mínimo: compactar antes de solapar.
     let width = ui.available_width();
-    let show_wordmark = width >= 1100.0;
-    let compact_actions = width < 920.0;
+    let show_wordmark = width >= 1240.0;
+    let compact_actions = width < 1050.0;
+    let read_only = app.state.is_read_only_view();
 
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(vec2(44.0, 22.0), Sense::hover());
@@ -445,10 +457,12 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
         }
         if show_wordmark {
             ui.label(RichText::new("TINDERBOXD").size(20.0).strong().color(BRIGHT));
-            ui.add_space(24.0);
+            ui.add_space(16.0);
         } else {
             ui.add_space(8.0);
         }
+        profile_selector(ui, app);
+        ui.add_space(12.0);
 
         for tab in Tab::ALL {
             let active = app.state.active_tab == tab;
@@ -469,10 +483,11 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
         ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
             if compact_actions {
                 ui.menu_button(RichText::new("+ Nuevo").strong().color(GREEN), |ui| {
-                    if ui.button(format!("Registrar interacción  ({}+R)", mod_key())).clicked() {
+                    let label = format!("Registrar interacción  ({}+R)", mod_key());
+                    if ui.add_enabled(!read_only, Button::new(label)).clicked() {
                         app.state.open_new_review();
                     }
-                    if ui.button(format!("Match  ({}+N)", mod_key())).clicked() {
+                    if ui.add_enabled(!read_only, Button::new(format!("Match  ({}+N)", mod_key()))).clicked() {
                         app.state.open_new_match();
                     }
                     if ui.button("Flag").clicked() {
@@ -483,10 +498,17 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
                 });
                 return;
             }
-            if ui.add(primary_button("+ Registrar")).on_hover_text(format!("{}+R", mod_key())).clicked() {
+            let hint = |key: &str| {
+                if read_only {
+                    "Cambia a «Tú» para añadir cosas".to_string()
+                } else {
+                    format!("{}+{key}", mod_key())
+                }
+            };
+            if ui.add_enabled(!read_only, primary_button("+ Registrar")).on_hover_text(hint("R")).clicked() {
                 app.state.open_new_review();
             }
-            if ui.add(secondary_button("+ Match")).on_hover_text(format!("{}+N", mod_key())).clicked() {
+            if ui.add_enabled(!read_only, secondary_button("+ Match")).on_hover_text(hint("N")).clicked() {
                 app.state.open_new_match();
             }
             if ui.add(secondary_button("+ Flag")).clicked() {
@@ -497,11 +519,67 @@ pub fn header(ui: &mut Ui, app: &mut GuiApp) {
     });
 }
 
-/// Entradas del menú «Compartir»: respaldo completo, importar y opción de fotos.
+/// Selector «Perfil: Tú ▾» con los perfiles importados y «Todos».
+fn profile_selector(ui: &mut Ui, app: &mut GuiApp) {
+    let current = app.state.owner_filter;
+    let color = if app.state.is_read_only_view() { ORANGE } else { GREEN };
+    let mut chosen = current;
+    ComboBox::from_id_salt("owner_filter")
+        .selected_text(RichText::new(format!("Perfil: {}", app.state.filter_label())).strong().color(color))
+        .width(150.0)
+        .show_ui(ui, |ui| {
+            for filter in app.state.owner_filters() {
+                let label = match filter {
+                    OwnerFilter::Mine => "Tú".to_string(),
+                    OwnerFilter::Owner(id) => format!("{} (importado)", app.state.owner_name(Some(id))),
+                    OwnerFilter::All => "Todos juntos".to_string(),
+                };
+                ui.selectable_value(&mut chosen, filter, label);
+            }
+            if app.state.owners.is_empty() {
+                ui.label(RichText::new("Importa el JSON de un amigo\npara compararlo aquí").small().color(DIM));
+            }
+        })
+        .response
+        .on_hover_text("Los datos importados de cada persona se ven por separado");
+    if chosen != current {
+        app.act(|st, db| st.set_owner_filter(db, chosen));
+    }
+}
+
+/// Aviso bajo la cabecera al ver un perfil importado.
+pub fn read_only_banner(ui: &mut Ui, app: &mut GuiApp) {
+    ui.horizontal(|ui| {
+        ui.label(
+            RichText::new(format!("Estás viendo los datos de {} · sólo lectura", app.state.filter_label()))
+                .strong()
+                .color(ORANGE),
+        );
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            if ui.add(danger_button("Borrar este perfil…")).clicked() {
+                app.state.open_delete_owner();
+            }
+            if ui.add(secondary_button("Volver a mis datos")).clicked() {
+                app.act(|st, db| st.set_owner_filter(db, OwnerFilter::Mine));
+            }
+        });
+    });
+}
+
+pub fn banner_frame() -> Frame {
+    Frame::new().fill(ORANGE.gamma_multiply(0.12)).inner_margin(Margin::symmetric(16, 6))
+}
+
+/// Entradas del menú «Compartir»: respaldo, importar y opción de fotos.
 fn share_menu_items(ui: &mut Ui, app: &mut GuiApp) {
-    if ui.button("Exportar todo a JSON…").clicked() {
+    let what = match app.state.owner_filter {
+        OwnerFilter::Mine => "mis datos".to_string(),
+        OwnerFilter::Owner(id) => format!("el perfil de {}", app.state.owner_name(Some(id))),
+        OwnerFilter::All => "todo (con perfiles)".to_string(),
+    };
+    if ui.button(format!("Exportar {what} a JSON…")).clicked() {
         ui.close();
-        app.export_with_dialog(ExportTarget::All);
+        app.export_with_dialog(ExportTarget::All(app.state.owner_filter));
     }
     if ui.button("Importar JSON…").clicked() {
         ui.close();
@@ -555,7 +633,7 @@ pub fn dashboard(ui: &mut Ui, app: &mut GuiApp) {
                 for i in 0..MAX_FAVORITES {
                     match favorites.get(i) {
                         Some(card) => {
-                            let resp = poster_tile(ui, card, false);
+                            let resp = poster_tile(ui, card, false, owner_tag(app, card.profile.owner_id));
                             if resp.clicked() {
                                 app.state.set_tab(Tab::Cartelera);
                                 app.state.select_match(card.profile.id);
@@ -586,7 +664,7 @@ pub fn dashboard(ui: &mut Ui, app: &mut GuiApp) {
                 }
                 for e in &recent {
                     let selected = app.state.selected_log == Some(e.log.id);
-                    let resp = diary_row(&mut cols[0], e, true, selected);
+                    let resp = diary_row(&mut cols[0], e, true, selected, owner_tag(app, e.owner_id));
                     if resp.clicked() {
                         app.state.selected_log = Some(e.log.id);
                         app.state.selected_match = Some(e.log.match_id);
@@ -674,7 +752,8 @@ pub fn matches(ui: &mut Ui, app: &mut GuiApp) {
                 ui.spacing_mut().item_spacing = vec2(18.0, 18.0);
                 for card in &cards {
                     let id = card.profile.id;
-                    let resp = poster_tile(ui, card, app.state.selected_match == Some(id));
+                    let owner = owner_tag(app, card.profile.owner_id);
+                    let resp = poster_tile(ui, card, app.state.selected_match == Some(id), owner);
                     if resp.clicked() {
                         app.state.select_match(id);
                     }
@@ -734,7 +813,22 @@ fn match_detail(ui: &mut Ui, app: &mut GuiApp, card: &MatchCard) {
     });
 
     ui.add_space(10.0);
+    let foreign = p.owner_id.is_some();
+    if foreign {
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(p.status.as_str()).strong().color(status_color(p.status)));
+            if p.is_favorite {
+                ui.label(RichText::new("◆ Top 4").color(BLUE));
+            }
+        });
+        ui.label(
+            RichText::new(format!("De {} · sólo lectura", app.state.owner_name(p.owner_id))).color(ORANGE),
+        );
+    }
     ui.horizontal(|ui| {
+        if foreign {
+            return;
+        }
         let mut status = p.status;
         ComboBox::from_id_salt("detail_status")
             .selected_text(RichText::new(status.as_str()).color(status_color(status)))
@@ -774,16 +868,16 @@ fn match_detail(ui: &mut Ui, app: &mut GuiApp, card: &MatchCard) {
 
     ui.add_space(12.0);
     ui.horizontal(|ui| {
-        if ui.add(primary_button("Registrar interacción")).clicked() {
+        if !foreign && ui.add(primary_button("Registrar interacción")).clicked() {
             app.state.open_new_review();
         }
-        if ui.add(secondary_button("Editar")).clicked() {
+        if !foreign && ui.add(secondary_button("Editar")).clicked() {
             app.state.open_edit_selected_match();
         }
         if ui.add(secondary_button("Compartir")).on_hover_text("Exportar este match a JSON").clicked() {
             app.export_with_dialog(ExportTarget::Match(p.id));
         }
-        if ui.add(danger_button("Borrar")).clicked() {
+        if !foreign && ui.add(danger_button("Borrar")).clicked() {
             app.state.open_delete(DeleteTarget::Match(p.id));
         }
     });
@@ -896,7 +990,7 @@ pub fn watchlist(ui: &mut Ui, app: &mut GuiApp) {
 // ---------------------------------------------------------------------------
 
 /// Fila del Diary: insignia de mes, día grande, match, interacción, estrellas, ♥.
-fn diary_row(ui: &mut Ui, e: &DiaryEntry, show_month: bool, selected: bool) -> Response {
+fn diary_row(ui: &mut Ui, e: &DiaryEntry, show_month: bool, selected: bool, owner: Option<String>) -> Response {
     let (rect, resp) = ui.allocate_exact_size(vec2(ui.available_width(), 46.0), Sense::click());
     let painter = ui.painter_at(rect);
     let l = &e.log;
@@ -932,13 +1026,22 @@ fn diary_row(ui: &mut Ui, e: &DiaryEntry, show_month: bool, selected: bool) -> R
     let text_clip = Rect::from_min_max(pos2(rect.left() + 100.0, rect.top()), pos2(rect.right() - right_cols, rect.bottom()));
     let tp = painter.with_clip_rect(text_clip);
     tp.text(pos2(text_clip.left(), y - 9.0), Align2::LEFT_CENTER, &e.match_alias, FontId::proportional(15.0), BRIGHT);
-    tp.text(
+    let sub = tp.text(
         pos2(text_clip.left(), y + 10.0),
         Align2::LEFT_CENTER,
         format!("{} · {}", l.interaction_type, e.platform),
         FontId::proportional(12.5),
         DIM,
     );
+    if let Some(name) = owner {
+        tp.text(
+            pos2(sub.right() + 6.0, y + 10.0),
+            Align2::LEFT_CENTER,
+            format!("· de {name}"),
+            FontId::proportional(12.5),
+            ORANGE,
+        );
+    }
 
     let x = rect.right() - right_cols + 10.0;
     painter.text(pos2(x, y), Align2::LEFT_CENTER, l.rating.stars(), FontId::proportional(17.0), GREEN);
@@ -980,7 +1083,8 @@ pub fn diary(ui: &mut Ui, app: &mut GuiApp) {
                 let month = (e.log.date_logged.year(), e.log.date_logged.month());
                 let show_month = last_month != Some(month);
                 last_month = Some(month);
-                let resp = diary_row(ui, e, show_month, app.state.selected_log == Some(e.log.id));
+                let owner = owner_tag(app, e.owner_id);
+                let resp = diary_row(ui, e, show_month, app.state.selected_log == Some(e.log.id), owner);
                 if resp.clicked() {
                     app.state.selected_log = Some(e.log.id);
                     app.state.selected_match = Some(e.log.match_id);
@@ -1138,18 +1242,22 @@ pub fn lists(ui: &mut Ui, app: &mut GuiApp) {
         if let Some(desc) = &list.description {
             ui.label(RichText::new(desc).color(TEXT));
         }
+        let foreign = list.owner_id.is_some();
+        if foreign {
+            ui.label(RichText::new(format!("Lista de {} · sólo lectura", app.state.owner_name(list.owner_id))).color(ORANGE));
+        }
         ui.add_space(8.0);
         ui.horizontal(|ui| {
-            if ui.add(primary_button("+ Añadir match")).clicked() {
+            if !foreign && ui.add(primary_button("+ Añadir match")).clicked() {
                 app.state.open_add_to_list();
             }
-            if ui.add(secondary_button("Editar")).clicked() {
+            if !foreign && ui.add(secondary_button("Editar")).clicked() {
                 app.state.open_edit_selected_list();
             }
             if ui.add(secondary_button("Compartir lista")).on_hover_text("Exportar la lista y sus matches a JSON").clicked() {
                 app.export_with_dialog(ExportTarget::List(list.id));
             }
-            if ui.add(danger_button("Borrar lista")).clicked() {
+            if !foreign && ui.add(danger_button("Borrar lista")).clicked() {
                 app.state.open_delete(DeleteTarget::List(list.id));
             }
         });
@@ -1196,6 +1304,9 @@ pub fn lists(ui: &mut Ui, app: &mut GuiApp) {
                         }
                         ui.horizontal(|ui| {
                             let mid = e.profile.id;
+                            if foreign {
+                                return;
+                            }
                             if list.is_ranked {
                                 if ui.add_enabled(i > 0, Button::new("◀").small()).on_hover_text("Subir").clicked() {
                                     app.act(move |st, db| st.move_list_item(db, mid, true));
@@ -1413,14 +1524,16 @@ pub fn modal(ctx: &egui::Context, app: &mut GuiApp) {
         ui.label(RichText::new(&title).size(20.0).strong().color(BRIGHT));
         ui.add_space(12.0);
 
-        let AppState { modal, cards, tags, status, .. } = &mut app.state;
+        // Sólo se reseñan o listan matches propios.
+        let own = app.state.own_cards();
+        let AppState { modal, tags, status, owners, .. } = &mut app.state;
         match modal {
             Some(Modal::MatchForm(d)) => match_form(ui, d, tags),
-            Some(Modal::ReviewForm(d)) => review_form(ui, d, cards),
+            Some(Modal::ReviewForm(d)) => review_form(ui, d, &own),
             Some(Modal::ListForm(d)) => list_form(ui, d),
-            Some(Modal::ListItemForm(d)) => item_form(ui, d, cards),
+            Some(Modal::ListItemForm(d)) => item_form(ui, d, &own),
             Some(Modal::TagForm(d)) => tag_form(ui, d),
-            Some(Modal::ImportForm(d)) => import_form(ui, d),
+            Some(Modal::ImportForm(d)) => import_form(ui, d, owners),
             Some(Modal::ConfirmDelete(_)) => {
                 ui.label(RichText::new(delete_text.as_deref().unwrap_or("")).size(15.0).color(TEXT));
             }
@@ -1628,7 +1741,7 @@ fn item_form(ui: &mut Ui, d: &mut ListItemDraft, cards: &[MatchCard]) {
     });
 }
 
-fn import_form(ui: &mut Ui, d: &mut ImportDraft) {
+fn import_form(ui: &mut Ui, d: &mut ImportDraft, owners: &[Owner]) {
     form_grid(ui, "import_form", |ui| {
         form_label(ui, "Archivo");
         ui.horizontal(|ui| {
@@ -1648,8 +1761,20 @@ fn import_form(ui: &mut Ui, d: &mut ImportDraft) {
             }
         });
         ui.end_row();
-        form_label(ui, "Prefijo (opcional)");
-        ui.add(TextEdit::singleline(&mut d.alias_prefix).hint_text("Nombre de tu amigo").desired_width(220.0));
+        form_label(ui, "Perfil (de quién es)");
+        ui.horizontal(|ui| {
+            ui.add(TextEdit::singleline(&mut d.owner_name).hint_text("Nombre de tu amigo").desired_width(180.0));
+            if !owners.is_empty() {
+                ui.menu_button("Existentes ▾", |ui| {
+                    for o in owners {
+                        if ui.button(&o.name).clicked() {
+                            d.owner_name = o.name.clone();
+                            ui.close();
+                        }
+                    }
+                });
+            }
+        });
         ui.end_row();
     });
     ui.add_space(8.0);
@@ -1658,10 +1783,13 @@ fn import_form(ui: &mut Ui, d: &mut ImportDraft) {
         Some(Err(e)) => ui.label(RichText::new(e).color(RED)),
         None => ui.label(RichText::new("Elige un archivo exportado desde Tinderboxd.").color(DIM)),
     };
-    let example = if d.alias_prefix.trim().is_empty() {
-        "Los matches que ya tengas (mismo alias, app y fecha) no se duplican.".to_string()
+    let example = if d.owner_name.trim().is_empty() {
+        "Sin perfil se restaura en tus datos (o en los perfiles que traiga el respaldo).".to_string()
     } else {
-        format!("Los alias quedarán como «{} · La chica del perro gigante».", d.alias_prefix.trim())
+        format!(
+            "Quedará en el perfil «{}», con sus propias estadísticas y sin mezclarse con lo tuyo.",
+            d.owner_name.trim()
+        )
     };
     ui.label(RichText::new(example).small().color(DIM));
 }

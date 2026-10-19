@@ -4,12 +4,12 @@ mod tui;
 
 use std::path::{Path, PathBuf};
 
-use anyhow::Result;
+use anyhow::{Result, bail};
 use clap::{ArgGroup, Parser};
 
 use crate::core::db::{DB_FILE_NAME, Database, default_db_path};
 use crate::core::export::{self, ExportOptions, ExportTarget, ImportOptions};
-use crate::core::models::{format_score_dots, format_stars};
+use crate::core::models::{OwnerFilter, format_score_dots, format_stars};
 use crate::core::state::AppState;
 
 /// Tinderboxd: tu Letterboxd de matches y citas.
@@ -49,9 +49,14 @@ struct Cli {
     #[arg(long, value_name = "ARCHIVO")]
     importar: Option<PathBuf>,
 
-    /// Con --importar: prefijo para los alias (p. ej. el nombre de tu amigo).
+    /// Con --importar: guarda todo en el perfil de esta persona (p. ej. tu amigo),
+    /// separado de tus datos. Sin --de, cada dato vuelve a su dueño original.
     #[arg(long, value_name = "NOMBRE", requires = "importar")]
     de: Option<String>,
+
+    /// Con --resumen/--exportar: qué datos usar («yo», el nombre de un perfil o «todos»).
+    #[arg(long, value_name = "PERFIL", default_value = "yo", conflicts_with = "importar")]
+    perfil: String,
 
     /// Ruta del archivo SQLite. Por defecto, en la carpeta de datos del usuario.
     #[arg(long, default_value_os_t = default_db_path())]
@@ -72,6 +77,28 @@ fn legacy_db_notice(cli: &Cli, is_new: bool) -> Option<String> {
     })
 }
 
+/// `--perfil`: «yo»/«tú» → tus datos, «todos» → todo, otro texto → ese perfil importado.
+fn parse_owner_filter(db: &Database, value: &str) -> Result<OwnerFilter> {
+    let v = value.trim().to_lowercase();
+    match v.as_str() {
+        "yo" | "tu" | "tú" | "mio" | "mío" => Ok(OwnerFilter::Mine),
+        "todos" | "todo" => Ok(OwnerFilter::All),
+        _ => {
+            let owners = db.list_owners()?;
+            match owners.iter().find(|o| o.name.to_lowercase() == v) {
+                Some(o) => Ok(OwnerFilter::Owner(o.id)),
+                None => {
+                    let names: Vec<&str> = owners.iter().map(|o| o.name.as_str()).collect();
+                    bail!(
+                        "no hay ningún perfil «{value}». Disponibles: yo, {}todos",
+                        names.iter().map(|n| format!("{n}, ")).collect::<String>()
+                    )
+                }
+            }
+        }
+    }
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
@@ -85,10 +112,11 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = &cli.exportar {
+        let filter = parse_owner_filter(&db, &cli.perfil)?;
         let target = match (&cli.solo_match, &cli.solo_lista) {
-            (Some(q), _) => ExportTarget::Match(export::find_match(&db, q)?),
-            (_, Some(q)) => ExportTarget::List(export::find_list(&db, q)?),
-            _ => ExportTarget::All,
+            (Some(q), _) => ExportTarget::Match(export::find_match(&db, q, filter)?),
+            (_, Some(q)) => ExportTarget::List(export::find_list(&db, q, filter)?),
+            _ => ExportTarget::All(filter),
         };
         let opts = ExportOptions { include_photos: !cli.sin_fotos };
         let bundle = export::export_to_file(&db, target, opts, path)?;
@@ -97,7 +125,7 @@ fn main() -> Result<()> {
         return Ok(());
     }
     if let Some(path) = &cli.importar {
-        let report = export::import_file(&db, path, &ImportOptions { alias_prefix: cli.de.clone() })?;
+        let report = export::import_file(&db, path, &ImportOptions { owner: cli.de.clone() })?;
         println!("✔ {}", report.summary());
         return Ok(());
     }
@@ -110,7 +138,9 @@ fn main() -> Result<()> {
         if seeded {
             println!("🌱 Base de datos nueva: datos de ejemplo insertados en {}", cli.db.display());
         }
-        print_summary(&AppState::load(&db)?);
+        let mut state = AppState { owner_filter: parse_owner_filter(&db, &cli.perfil)?, ..AppState::default() };
+        state.refresh(&db)?;
+        print_summary(&state);
         Ok(())
     } else if cli.gui {
         gui::run(db, notice)
@@ -121,7 +151,11 @@ fn main() -> Result<()> {
 
 /// Volcado de los datos en consola (`--resumen`).
 fn print_summary(state: &AppState) {
-    println!("\n══════════════ TINDERBOXD · resumen ══════════════");
+    println!("\n══════════════ TINDERBOXD · resumen · perfil: {} ══════════════", state.filter_label());
+    if !state.owners.is_empty() {
+        let names: Vec<&str> = state.owners.iter().map(|o| o.name.as_str()).collect();
+        println!("Perfiles importados: {} (usa --perfil NOMBRE o --perfil todos)", names.join(", "));
+    }
 
     println!("\n★ TOP 4 FAVORITOS");
     for card in state.favorites() {

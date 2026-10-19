@@ -116,6 +116,11 @@ impl eframe::App for GuiApp {
         egui::Panel::top("header")
             .frame(views::header_frame())
             .show(ui, |ui| views::header(ui, self));
+        if self.state.is_read_only_view() {
+            egui::Panel::top("read_only_banner")
+                .frame(views::banner_frame())
+                .show(ui, |ui| views::read_only_banner(ui, self));
+        }
         egui::Panel::bottom("status")
             .frame(views::status_frame())
             .show(ui, |ui| views::status_bar(ui, self));

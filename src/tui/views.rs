@@ -10,7 +10,7 @@ use ratatui::widgets::{
 };
 
 use crate::core::models::{
-    DiaryEntry, MatchCard, MatchStatus, Tag, TagCategory, format_score_dots,
+    DiaryEntry, MatchCard, MatchStatus, OwnerFilter, Tag, TagCategory, format_score_dots,
 };
 use crate::core::state::{Modal, SortBy, Tab, today};
 
@@ -154,8 +154,25 @@ fn render_header(f: &mut Frame, area: Rect, app: &TuiApp) {
         spans.push(Span::styled(format!(" {} ", tab.title()), style));
         spans.push(s("  ", TEXT));
     }
+
+    // Perfil visible, a la derecha.
+    let read_only = app.state.is_read_only_view();
+    let mut profile = vec![
+        s("[u] Perfil: ", DIM),
+        bold(app.state.filter_label(), if read_only { ORANGE } else { GREEN }),
+    ];
+    if read_only {
+        profile.push(s(" · sólo lectura", ORANGE));
+    }
+    let profile = Line::from(profile);
+
     let block = Block::new().borders(Borders::BOTTOM).border_style(Style::new().fg(BORDER));
-    f.render_widget(Paragraph::new(Line::from(spans)).block(block), area);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [tabs_area, profile_area] =
+        Layout::horizontal([Constraint::Min(0), Constraint::Length(profile.width() as u16 + 1)]).areas(inner);
+    f.render_widget(Paragraph::new(Line::from(spans)), tabs_area);
+    f.render_widget(Paragraph::new(profile), profile_area);
 }
 
 fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
@@ -169,6 +186,16 @@ fn render_footer(f: &mut Frame, area: Rect, app: &TuiApp) {
 
     let hints: &[(&str, &str)] = if app.searching {
         &[("Enter", "aplicar"), ("Esc", "borrar búsqueda"), ("Ctrl+U", "limpiar")]
+    } else if app.state.is_read_only_view() {
+        &[
+            ("u", "cambiar perfil"),
+            ("X", "borrar este perfil"),
+            ("E", "exportar"),
+            ("hjkl", "mover"),
+            ("Tab", "pestaña"),
+            ("?", "ayuda"),
+            ("q", "salir"),
+        ]
     } else {
         match app.state.active_tab {
             Tab::Dashboard | Tab::Diary => &[
@@ -257,7 +284,7 @@ fn render_dashboard(f: &mut Frame, area: Rect, app: &TuiApp) {
     let favorites = st.favorites();
     for (i, slot) in slots.iter().enumerate() {
         match favorites.get(i) {
-            Some(card) => render_card(f, *slot, card, false),
+            Some(card) => render_card(f, *slot, card, false, owner_tag(app, card.profile.owner_id)),
             None => {
                 let b = Block::bordered()
                     .border_type(BorderType::Plain)
@@ -280,8 +307,13 @@ fn render_dashboard(f: &mut Frame, area: Rect, app: &TuiApp) {
 // Matches (cuadrícula)
 // ---------------------------------------------------------------------------
 
+/// En la vista «Todos», de quién es un dato importado (lo tuyo no se etiqueta).
+fn owner_tag(app: &TuiApp, owner_id: Option<i64>) -> Option<String> {
+    (app.state.owner_filter == OwnerFilter::All && owner_id.is_some()).then(|| app.state.owner_name(owner_id))
+}
+
 /// Tarjeta compacta tipo póster.
-fn render_card(f: &mut Frame, area: Rect, card: &MatchCard, selected: bool) {
+fn render_card(f: &mut Frame, area: Rect, card: &MatchCard, selected: bool, owner: Option<String>) {
     let p = &card.profile;
     let block = Block::bordered()
         .border_type(if selected { BorderType::Thick } else { BorderType::Rounded })
@@ -301,9 +333,14 @@ fn render_card(f: &mut Frame, area: Rect, card: &MatchCard, selected: bool) {
     }
     let stars = if card.log_count == 0 { s("sin reseñas", DIM) } else { s(card.avg_stars(), GREEN) };
 
+    let mut info_line = vec![s(truncate(&info, w), DIM)];
+    if let Some(name) = owner {
+        info_line.push(s(format!(" · de {name}"), ORANGE));
+    }
+
     let lines = vec![
         Line::from(bold(truncate(&p.alias, w), BRIGHT)),
-        Line::from(s(truncate(&info, w), DIM)),
+        Line::from(info_line),
         Line::from(status_line),
         Line::from(vec![stars, heart(card.liked)]),
     ];
@@ -378,7 +415,7 @@ fn render_matches(f: &mut Frame, area: Rect, app: &TuiApp) {
             let row = (i / cols - first_row) as u16;
             let col = (i % cols) as u16;
             let rect = Rect::new(inner.x + col * card_w, inner.y + row * CARD_H, card_w, CARD_H);
-            render_card(f, rect, card, i == cursor);
+            render_card(f, rect, card, i == cursor, owner_tag(app, card.profile.owner_id));
         }
     }
 
@@ -406,6 +443,9 @@ fn render_match_detail(f: &mut Frame, area: Rect, app: &TuiApp, card: Option<&Ma
     let mut status = vec![bold(p.status.as_str(), status_color(p.status))];
     if p.is_favorite {
         status.push(s("  ◆ Top 4", BLUE));
+    }
+    if p.owner_id.is_some() {
+        status.push(s(format!("  · de {} (sólo lectura)", app.state.owner_name(p.owner_id)), ORANGE));
     }
 
     // Cabecera (junto a la foto, si la hay) y cuerpo (debajo).
@@ -601,7 +641,10 @@ fn render_diary_table(f: &mut Frame, area: Rect, app: &TuiApp, entries: &[DiaryE
             Row::new(vec![
                 Cell::from(month_cell),
                 Cell::from(bold(l.date_logged.format("%d").to_string(), BRIGHT)),
-                Cell::from(s(e.match_alias.clone(), BRIGHT)),
+                Cell::from(Line::from(match owner_tag(app, e.owner_id) {
+                    Some(name) => vec![s(e.match_alias.clone(), BRIGHT), s(format!(" · {name}"), ORANGE)],
+                    None => vec![s(e.match_alias.clone(), BRIGHT)],
+                })),
                 Cell::from(s(l.interaction_type.as_str(), TEXT)),
                 Cell::from(Line::from(vec![s(l.rating.stars(), GREEN), heart(l.liked)])),
                 Cell::from(s(if l.contains_spoilers { "⚠" } else { "" }, ORANGE)),
@@ -987,7 +1030,7 @@ fn field_value(app: &TuiApp, modal: &Modal, field: Field, focused: bool) -> Vec<
             choice(format!("● {}", d.category), tag_color(d.category), focused)
         }
         (Modal::ImportForm(d), Field::ImportPath) => text(&d.path),
-        (Modal::ImportForm(d), Field::ImportPrefix) => text(&d.alias_prefix),
+        (Modal::ImportForm(d), Field::ImportPrefix) => text(&d.owner_name),
         _ => vec![],
     }
 }
@@ -1015,7 +1058,7 @@ fn render_modal(f: &mut Frame, area: Rect, app: &TuiApp, modal: &Modal) {
     let fields = form_fields(modal);
     let focused_field = app.focused_field();
     let width = area.width.saturating_sub(4).min(84);
-    let extra = if matches!(modal, Modal::ImportForm(_)) { 5 } else { 0 };
+    let extra = if matches!(modal, Modal::ImportForm(_)) { 6 } else { 0 };
     let rect = area.centered(
         Constraint::Length(width),
         Constraint::Length((fields.len() as u16 + 9 + extra).min(area.height)),
@@ -1049,9 +1092,10 @@ fn render_modal(f: &mut Frame, area: Rect, app: &TuiApp, modal: &Modal) {
             None => Line::from(s("  Escribe la ruta del archivo (Tab para comprobarlo)", DIM)),
         });
         lines.push(Line::from(s(
-            "  El prefijo marca de quién son los matches: «Ana · La chica del perro…»",
+            "  Con un perfil, sus datos y estadísticas quedan aparte de los tuyos (u para cambiar).",
             DIM,
         )));
+        lines.push(Line::from(s("  Vacío: restaura en tus datos (respaldo propio).", DIM)));
     }
     f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), form_area);
 
@@ -1096,6 +1140,8 @@ fn render_help(f: &mut Frame, area: Rect) {
         ("P", "Mostrar/ocultar fotos en la ficha"),
         ("E", "Exportar a JSON (match/lista seleccionados o todo)"),
         ("I", "Importar un JSON de Tinderboxd"),
+        ("u", "Cambiar de perfil: Tú → importados → Todos"),
+        ("X", "Borrar el perfil importado que estás viendo"),
         ("/", "Buscar por alias, bio o flag"),
         ("p · c · o", "Filtrar app · filtrar estado · cambiar orden"),
         ("L · * · x", "Sólo ♥ · sólo Top 4 · limpiar filtros"),

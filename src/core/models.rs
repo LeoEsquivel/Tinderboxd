@@ -252,6 +252,37 @@ pub fn format_score_dots(score: u8) -> String {
 // Entidades (tablas)
 // ---------------------------------------------------------------------------
 
+/// Tabla `owners`: de quién son los datos importados ("Ana", "Beto"…).
+/// Tus propios datos no tienen dueño (`owner_id = NULL`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Owner {
+    pub id: i64,
+    pub name: String,
+}
+
+/// Qué datos se están viendo.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum OwnerFilter {
+    /// Sólo los tuyos.
+    #[default]
+    Mine,
+    /// Sólo los importados de ese dueño.
+    Owner(i64),
+    /// Todo junto.
+    All,
+}
+
+impl OwnerFilter {
+    /// Filtro que muestra los datos de ese dueño (`None` = los tuyos).
+    pub fn of(owner_id: Option<i64>) -> Self {
+        match owner_id {
+            Some(id) => OwnerFilter::Owner(id),
+            None => OwnerFilter::Mine,
+        }
+    }
+
+}
+
 /// Tabla `matches`: cada persona con la que hiciste match.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MatchProfile {
@@ -264,10 +295,12 @@ pub struct MatchProfile {
     pub match_date: Option<NaiveDate>,
     pub status: MatchStatus,
     pub is_favorite: bool,
+    /// `None` = tuyo; `Some(id)` = importado de ese dueño (sólo lectura).
+    pub owner_id: Option<i64>,
 }
 
 impl MatchProfile {
-    /// Perfil nuevo (aún sin persistir, `id = 0`).
+    /// Perfil nuevo (aún sin persistir, `id = 0`), tuyo.
     pub fn new(alias: impl Into<String>, platform: Platform, status: MatchStatus) -> Self {
         MatchProfile {
             id: 0,
@@ -279,6 +312,7 @@ impl MatchProfile {
             match_date: None,
             status,
             is_favorite: false,
+            owner_id: None,
         }
     }
 
@@ -350,6 +384,8 @@ pub struct CustomList {
     pub title: String,
     pub description: Option<String>,
     pub is_ranked: bool,
+    /// `None` = tuya; `Some(id)` = importada de ese dueño.
+    pub owner_id: Option<i64>,
 }
 
 /// Tabla `list_items`.
@@ -392,6 +428,8 @@ pub struct DiaryEntry {
     pub log: InteractionLog,
     pub match_alias: String,
     pub platform: Platform,
+    /// Dueño del match (`None` = tuyo).
+    pub owner_id: Option<i64>,
 }
 
 /// Item de una lista con su match resuelto.

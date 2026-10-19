@@ -137,7 +137,7 @@ impl Field {
             Field::TagName => "Nombre",
             Field::TagKind => "Categoría",
             Field::ImportPath => "Archivo JSON",
-            Field::ImportPrefix => "Prefijo (opcional)",
+            Field::ImportPrefix => "Perfil (de quién es)",
         }
     }
 
@@ -185,7 +185,7 @@ fn text_mut(modal: &mut Modal, field: Field) -> Option<&mut String> {
         (Modal::ListItemForm(d), Field::ItemNote) => Some(&mut d.note),
         (Modal::TagForm(d), Field::TagName) => Some(&mut d.name),
         (Modal::ImportForm(d), Field::ImportPath) => Some(&mut d.path),
-        (Modal::ImportForm(d), Field::ImportPrefix) => Some(&mut d.alias_prefix),
+        (Modal::ImportForm(d), Field::ImportPrefix) => Some(&mut d.owner_name),
         _ => None,
     }
 }
@@ -441,6 +441,8 @@ impl TuiApp {
                 self.show_photos = !self.show_photos;
                 self.state.info(if self.show_photos { "Fotos visibles" } else { "Fotos ocultas" });
             }
+            KeyCode::Char('u') => self.state.cycle_owner_filter(&self.db)?,
+            KeyCode::Char('X') => self.state.open_delete_owner(),
             KeyCode::Char('E') => self.state.quick_export(&self.db)?,
             KeyCode::Char('I') => self.state.open_import(None),
             KeyCode::Char('v') => {
@@ -644,9 +646,10 @@ impl TuiApp {
                 }
             }
             FieldKind::Choice | FieldKind::Toggle => {
-                let AppState { modal, cards, .. } = &mut self.state;
-                if let Some(modal) = modal {
-                    adjust(modal, field, delta, cards);
+                // Sólo se reseñan o listan matches propios.
+                let own = self.state.own_cards();
+                if let Some(modal) = &mut self.state.modal {
+                    adjust(modal, field, delta, &own);
                 }
             }
         }
@@ -866,9 +869,22 @@ mod tests {
         assert!(draw(&app, 120, 40).contains("Respaldo completo"));
         press(&mut app, KeyCode::Enter);
         assert!(app.state.modal.is_none(), "{:?}", app.state.status);
-        assert_eq!(app.state.cards.len(), 8);
-        assert!(app.state.cards.iter().any(|c| c.profile.alias == "Ana · Crypto Bro de Polanco"));
         let _ = std::fs::remove_file(&path);
+
+        // Queda en su propio perfil (sin prefijo en los alias) y la cabecera lo indica.
+        assert_eq!(app.state.filter_label(), "Ana");
+        assert_eq!(app.state.cards.len(), 4);
+        assert!(app.state.cards.iter().any(|c| c.profile.alias == "Crypto Bro de Polanco"));
+        let screen = draw(&app, 140, 40);
+        assert!(screen.contains("Perfil: Ana"), "{screen}");
+        assert!(screen.contains("sólo lectura"));
+
+        // u cicla: Ana → Todos → Tú.
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.state.cards.len(), 8);
+        press(&mut app, KeyCode::Char('u'));
+        assert_eq!(app.state.filter_label(), "Tú");
+        assert_eq!(app.state.cards.len(), 4);
     }
 
     /// `cargo test preview -- --ignored --nocapture` imprime las pantallas.

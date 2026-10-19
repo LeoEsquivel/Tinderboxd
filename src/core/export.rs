@@ -4,6 +4,10 @@
 //! reseñas, flags y (opcionalmente) fotos en base64, más listas que referencian
 //! a los matches por una clave local (`"m1"`, `"m2"`…). Los ids de SQLite nunca
 //! salen del equipo, así que importar en otra base de datos es seguro.
+//!
+//! Perfiles: lo importado de un amigo queda bajo su nombre (`owners`), separado
+//! de tus datos. Cada match/lista exportado lleva el nombre de su dueño (si no es
+//! tuyo), así un respaldo completo se restaura sin mezclar perfiles.
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
@@ -17,8 +21,8 @@ use serde::{Deserialize, Serialize};
 
 use super::db::{Database, MAX_FAVORITES, photo_extension};
 use super::models::{
-    CustomList, InteractionLog, InteractionType, MatchProfile, MatchStatus, Platform, Rating,
-    TagCategory,
+    CustomList, InteractionLog, InteractionType, MatchProfile, MatchStatus, Owner, OwnerFilter,
+    Platform, Rating, TagCategory,
 };
 
 /// Identificador del formato en el campo `format`.
@@ -75,6 +79,9 @@ pub struct ExportMatch {
     pub logs: Vec<ExportLog>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub photo: Option<ExportPhoto>,
+    /// Perfil al que pertenece (ausente = de quien exportó).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -117,6 +124,9 @@ pub struct ExportList {
     #[serde(default)]
     pub is_ranked: bool,
     pub items: Vec<ExportListItem>,
+    /// Perfil al que pertenece (ausente = de quien exportó).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -146,13 +156,31 @@ impl ExportBundle {
         let date = chrono::DateTime::parse_from_rfc3339(&self.exported_at)
             .map(|d| d.format("%d/%m/%Y %H:%M").to_string())
             .unwrap_or_else(|_| self.exported_at.clone());
-        format!(
+        let mut text = format!(
             "{kind} el {date}: {} · {} · {} · {}",
             plural(self.matches.len(), "match", "matches"),
             plural(self.log_count(), "reseña", "reseñas"),
             plural(self.lists.len(), "lista", "listas"),
             plural(self.photo_count(), "foto", "fotos"),
-        )
+        );
+        let owners = self.owner_names();
+        if !owners.is_empty() {
+            text.push_str(&format!(" · perfiles: {}", owners.join(", ")));
+        }
+        text
+    }
+
+    /// Perfiles (distintos de quien exportó) que aparecen en el archivo.
+    pub fn owner_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .matches
+            .iter()
+            .filter_map(|m| m.owner.clone())
+            .chain(self.lists.iter().filter_map(|l| l.owner.clone()))
+            .collect();
+        names.sort_by_key(|n| n.to_lowercase());
+        names.dedup_by(|a, b| a.eq_ignore_ascii_case(b));
+        names
     }
 }
 
@@ -167,7 +195,8 @@ fn plural(n: usize, one: &str, many: &str) -> String {
 /// Qué se exporta.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportTarget {
-    All,
+    /// Todo lo del filtro: tus datos, los de un perfil o todo junto.
+    All(OwnerFilter),
     Match(i64),
     List(i64),
 }
@@ -186,10 +215,10 @@ impl Default for ExportOptions {
 
 pub fn export(db: &Database, target: ExportTarget, opts: ExportOptions) -> Result<ExportBundle> {
     let (kind, match_ids, list_ids): (ExportKind, Vec<i64>, Vec<i64>) = match target {
-        ExportTarget::All => (
+        ExportTarget::All(filter) => (
             ExportKind::Completo,
-            db.list_matches()?.iter().map(|m| m.id).collect(),
-            db.list_lists()?.iter().map(|l| l.id).collect(),
+            db.list_matches(filter)?.iter().map(|m| m.id).collect(),
+            db.list_lists(filter)?.iter().map(|l| l.id).collect(),
         ),
         ExportTarget::Match(id) => {
             db.get_match(id)?.ok_or_else(|| anyhow!("no existe el match con id {id}"))?;
@@ -204,6 +233,8 @@ pub fn export(db: &Database, target: ExportTarget, opts: ExportOptions) -> Resul
 
     let keys: HashMap<i64, String> =
         match_ids.iter().enumerate().map(|(i, id)| (*id, format!("m{}", i + 1))).collect();
+    let owner_names: HashMap<i64, String> = db.list_owners()?.into_iter().map(|o| (o.id, o.name)).collect();
+    let owner_of = |id: Option<i64>| id.and_then(|id| owner_names.get(&id).cloned());
 
     let mut matches = Vec::with_capacity(match_ids.len());
     for id in &match_ids {
@@ -225,6 +256,7 @@ pub fn export(db: &Database, target: ExportTarget, opts: ExportOptions) -> Resul
                 .collect(),
             logs: db.logs_for_match(*id)?.into_iter().map(export_log).collect(),
             photo,
+            owner: owner_of(p.owner_id),
         });
     }
 
@@ -246,6 +278,7 @@ pub fn export(db: &Database, target: ExportTarget, opts: ExportOptions) -> Resul
                     })
                 })
                 .collect(),
+            owner: owner_of(list.owner_id),
         });
     }
 
@@ -295,7 +328,13 @@ pub fn export_to_file(db: &Database, target: ExportTarget, opts: ExportOptions, 
 /// Nombre sugerido: `tinderboxd-lista-citas-que-debieron-20261017.json`.
 pub fn suggested_file_name(db: &Database, target: ExportTarget) -> Result<String> {
     let label = match target {
-        ExportTarget::All => "respaldo".to_string(),
+        ExportTarget::All(OwnerFilter::Mine) => "respaldo".to_string(),
+        ExportTarget::All(OwnerFilter::All) => "respaldo-completo".to_string(),
+        ExportTarget::All(OwnerFilter::Owner(id)) => {
+            let owners = db.list_owners()?;
+            let name = owners.iter().find(|o| o.id == id).map(|o| o.name.as_str()).unwrap_or("perfil");
+            format!("perfil-{}", slug(name))
+        }
         ExportTarget::Match(id) => {
             let m = db.get_match(id)?.ok_or_else(|| anyhow!("no existe el match con id {id}"))?;
             format!("match-{}", slug(&m.alias))
@@ -382,8 +421,10 @@ fn validate(bundle: &ExportBundle) -> Result<()> {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ImportOptions {
-    /// Prefijo para los alias (p. ej. el nombre de tu amigo): `"Ana · La chica del perro gigante"`.
-    pub alias_prefix: Option<String>,
+    /// Perfil donde guardar todo (p. ej. el nombre de quien te pasó el archivo).
+    /// Sin perfil, cada dato vuelve a su dueño original: tuyo, o el perfil que
+    /// indique el archivo (así se restaura un respaldo completo sin mezclar).
+    pub owner: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -401,12 +442,18 @@ pub struct ImportReport {
     pub photos_imported: usize,
     /// Favoritos que no cupieron en el Top 4.
     pub favorites_dropped: usize,
+    /// Perfil en el que quedó todo (si se importó en uno concreto).
+    pub owner: Option<Owner>,
 }
 
 impl ImportReport {
     pub fn summary(&self) -> String {
+        let place = match &self.owner {
+            Some(o) => format!("el perfil «{}»", o.name),
+            None => "tu Tinderboxd".to_string(),
+        };
         if self.matches_created + self.logs_created + self.lists_created == 0 {
-            return "Nada nuevo que importar: todo lo del archivo ya estaba en tu Tinderboxd".to_string();
+            return format!("Nada nuevo que importar: todo lo del archivo ya estaba en {place}");
         }
         let mut parts = vec![
             format!("{} nuevos", plural(self.matches_created, "match", "matches")),
@@ -425,7 +472,7 @@ impl ImportReport {
         if self.favorites_dropped > 0 {
             parts.push(format!("{} favoritos no cupieron en el Top {MAX_FAVORITES}", self.favorites_dropped));
         }
-        format!("Importado: {}", parts.join(" · "))
+        format!("Importado en {place}: {}", parts.join(" · "))
     }
 }
 
@@ -454,20 +501,42 @@ fn import_inner(
     written_photos: &mut Vec<String>,
 ) -> Result<ImportReport> {
     let mut report = ImportReport::default();
-    let existing = db.list_matches()?;
-    let mut favorites = db.favorites()?.len();
+    let forced = opts.owner.as_deref().map(str::trim).filter(|n| !n.is_empty());
+
+    // Nombre de dueño → id, creando el perfil la primera vez que aparece.
+    let mut owner_ids: HashMap<String, i64> = HashMap::new();
+    let mut resolve_owner = |db: &Database, name: Option<&str>| -> Result<Option<i64>> {
+        let Some(name) = forced.or(name.map(str::trim).filter(|n| !n.is_empty())) else {
+            return Ok(None);
+        };
+        if let Some(id) = owner_ids.get(&name.to_lowercase()) {
+            return Ok(Some(*id));
+        }
+        let id = db.get_or_create_owner(name)?;
+        owner_ids.insert(name.to_lowercase(), id);
+        Ok(Some(id))
+    };
+    if let Some(typed) = forced {
+        let id = resolve_owner(db, None)?.expect("con perfil forzado siempre hay dueño");
+        // El nombre tal como quedó guardado («Ana» aunque se escriba «ana»).
+        let name = db.list_owners()?.into_iter().find(|o| o.id == id).map(|o| o.name);
+        report.owner = Some(Owner { id, name: name.unwrap_or_else(|| typed.to_string()) });
+    }
+
+    // Duplicados y Top 4 se miden dentro de cada perfil.
+    let existing = db.list_matches(OwnerFilter::All)?;
+    let mut favorites: HashMap<Option<i64>, usize> = HashMap::new();
     let mut known_tags: HashSet<String> = db.list_tags()?.into_iter().map(|t| t.name).collect();
     let mut key_to_id: HashMap<&str, i64> = HashMap::new();
-    let prefix = opts.alias_prefix.as_deref().map(str::trim).filter(|p| !p.is_empty());
 
     for m in &bundle.matches {
-        let alias = match prefix {
-            Some(p) => format!("{p} · {}", m.alias.trim()),
-            None => m.alias.trim().to_string(),
-        };
+        let owner_id = resolve_owner(db, m.owner.as_deref())?;
+        let alias = m.alias.trim().to_string();
         let found = existing
             .iter()
-            .find(|e| e.alias == alias && e.platform == m.platform && e.match_date == m.match_date)
+            .find(|e| {
+                e.owner_id == owner_id && e.alias == alias && e.platform == m.platform && e.match_date == m.match_date
+            })
             .map(|e| e.id);
 
         let match_id = match found {
@@ -488,12 +557,15 @@ fn import_inner(
                     }
                     None => None,
                 };
-                let is_favorite = m.is_favorite && favorites < MAX_FAVORITES;
-                if is_favorite {
-                    favorites += 1;
-                } else if m.is_favorite {
+                let count = match favorites.get(&owner_id) {
+                    Some(c) => *c,
+                    None => db.favorites(OwnerFilter::of(owner_id))?.len(),
+                };
+                let is_favorite = m.is_favorite && count < MAX_FAVORITES;
+                if m.is_favorite && !is_favorite {
                     report.favorites_dropped += 1;
                 }
+                favorites.insert(owner_id, count + usize::from(is_favorite));
                 report.matches_created += 1;
                 db.insert_match(&MatchProfile {
                     id: 0,
@@ -505,6 +577,7 @@ fn import_inner(
                     match_date: m.match_date,
                     status: m.status,
                     is_favorite,
+                    owner_id,
                 })?
             }
         };
@@ -544,26 +617,29 @@ fn import_inner(
         }
     }
 
-    // Contenido actual de cada lista, para no duplicar una idéntica al reimportar.
-    let mut existing_lists: Vec<(String, Vec<i64>)> = Vec::new();
-    for l in db.list_lists()? {
+    // Contenido actual de cada lista (por perfil), para no duplicar una idéntica al reimportar.
+    let mut existing_lists: Vec<(Option<i64>, String, Vec<i64>)> = Vec::new();
+    for l in db.list_lists(OwnerFilter::All)? {
         let ids = db.list_entries(l.id)?.iter().map(|e| e.item.match_id).collect();
-        existing_lists.push((l.title, ids));
+        existing_lists.push((l.owner_id, l.title, ids));
     }
-    let mut titles: HashSet<String> = existing_lists.iter().map(|(t, _)| t.clone()).collect();
+    let mut titles: HashSet<(Option<i64>, String)> =
+        existing_lists.iter().map(|(o, t, _)| (*o, t.clone())).collect();
 
     for list in &bundle.lists {
+        let owner_id = resolve_owner(db, list.owner.as_deref())?;
         let mut items: Vec<&ExportListItem> = list.items.iter().collect();
         items.sort_by_key(|i| i.rank_order);
         let ids: Vec<i64> = items.iter().map(|i| key_to_id[i.match_key.as_str()]).collect();
-        if existing_lists.iter().any(|(t, existing)| t == list.title.trim() && *existing == ids) {
+        if existing_lists.iter().any(|(o, t, existing)| *o == owner_id && t == list.title.trim() && *existing == ids)
+        {
             report.lists_existing += 1;
             continue;
         }
 
         let mut title = list.title.trim().to_string();
         let mut n = 1;
-        while titles.contains(&title) {
+        while titles.contains(&(owner_id, title.clone())) {
             title = if n == 1 {
                 format!("{} (importada)", list.title.trim())
             } else {
@@ -571,13 +647,14 @@ fn import_inner(
             };
             n += 1;
         }
-        titles.insert(title.clone());
+        titles.insert((owner_id, title.clone()));
 
         let list_id = db.create_list(&CustomList {
             id: 0,
             title,
             description: list.description.clone(),
             is_ranked: list.is_ranked,
+            owner_id,
         })?;
         for (item, match_id) in items.iter().zip(&ids) {
             db.add_list_item(list_id, *match_id, item.note.as_deref())?;
@@ -592,9 +669,9 @@ fn import_inner(
 // Búsqueda por texto (para la línea de comandos)
 // ---------------------------------------------------------------------------
 
-/// Encuentra un match por id o por parte del alias (debe ser único).
-pub fn find_match(db: &Database, query: &str) -> Result<i64> {
-    let matches = db.list_matches()?;
+/// Encuentra un match del filtro por id o por parte del alias (debe ser único).
+pub fn find_match(db: &Database, query: &str, filter: OwnerFilter) -> Result<i64> {
+    let matches = db.list_matches(filter)?;
     if let Ok(id) = query.trim().parse::<i64>()
         && matches.iter().any(|m| m.id == id)
     {
@@ -612,9 +689,9 @@ pub fn find_match(db: &Database, query: &str) -> Result<i64> {
     }
 }
 
-/// Encuentra una lista por id o por parte del título (debe ser única).
-pub fn find_list(db: &Database, query: &str) -> Result<i64> {
-    let lists = db.list_lists()?;
+/// Encuentra una lista del filtro por id o por parte del título (debe ser única).
+pub fn find_list(db: &Database, query: &str, filter: OwnerFilter) -> Result<i64> {
+    let lists = db.list_lists(filter)?;
     if let Ok(id) = query.trim().parse::<i64>()
         && lists.iter().any(|l| l.id == id)
     {
@@ -649,7 +726,7 @@ mod tests {
     #[test]
     fn full_export_roundtrips_into_empty_db() {
         let src = seeded();
-        let bundle = roundtrip(&export(&src, ExportTarget::All, ExportOptions::default()).unwrap());
+        let bundle = roundtrip(&export(&src, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap());
         assert_eq!(bundle.kind, ExportKind::Completo);
         assert_eq!(bundle.matches.len(), 4);
         assert_eq!(bundle.log_count(), 7);
@@ -661,61 +738,93 @@ mod tests {
         assert_eq!(report.tags_created, src.list_tags().unwrap().len());
         assert_eq!(report.lists_created, 1);
 
-        let (a, b) = (src.stats().unwrap(), dst.stats().unwrap());
+        let (a, b) = (src.stats(OwnerFilter::Mine).unwrap(), dst.stats(OwnerFilter::Mine).unwrap());
         assert_eq!(a.rating_distribution, b.rating_distribution);
         assert_eq!(a.funnel, b.funnel);
         assert_eq!(a.top_red_flags.len(), b.top_red_flags.len());
-        let list = dst.list_lists().unwrap().remove(0);
+        let list = dst.list_lists(OwnerFilter::Mine).unwrap().remove(0);
         let entries = dst.list_entries(list.id).unwrap();
         assert_eq!(entries.len(), 3);
         assert_eq!(entries[0].profile.alias, "Crypto Bro de Polanco");
-        assert_eq!(dst.favorites().unwrap().len(), 2);
+        assert_eq!(dst.favorites(OwnerFilter::Mine).unwrap().len(), 2);
     }
 
     #[test]
     fn reimport_does_not_duplicate() {
         let db = seeded();
-        let bundle = export(&db, ExportTarget::All, ExportOptions::default()).unwrap();
+        let bundle = export(&db, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap();
         let report = import(&db, &bundle, &ImportOptions::default()).unwrap();
         assert_eq!(report.matches_created, 0);
         assert_eq!(report.matches_existing, 4);
         assert_eq!(report.logs_skipped, 7);
-        assert_eq!(db.list_matches().unwrap().len(), 4);
-        assert_eq!(db.diary(None).unwrap().len(), 7);
+        assert_eq!(db.list_matches(OwnerFilter::Mine).unwrap().len(), 4);
+        assert_eq!(db.diary(None, OwnerFilter::Mine).unwrap().len(), 7);
         assert_eq!(report.lists_created, 0);
         assert_eq!(report.lists_existing, 1);
-        assert_eq!(db.list_lists().unwrap().len(), 1);
+        assert_eq!(db.list_lists(OwnerFilter::Mine).unwrap().len(), 1);
         assert!(report.summary().starts_with("Nada nuevo"));
     }
 
     #[test]
-    fn friend_prefix_creates_copies_and_respects_top4() {
+    fn friend_import_goes_to_its_own_profile() {
         let db = seeded();
-        let bundle = export(&db, ExportTarget::All, ExportOptions::default()).unwrap();
-        let ana = import(&db, &bundle, &ImportOptions { alias_prefix: Some("Ana".into()) }).unwrap();
-        assert_eq!(ana.matches_created, 4);
-        assert_eq!(ana.favorites_dropped, 0); // 2 propios + 2 de Ana = 4
-        assert!(db.list_matches().unwrap().iter().any(|m| m.alias == "Ana · Crypto Bro de Polanco"));
-        // Mismo título pero con los matches de Ana: es otra lista.
-        let titles: Vec<String> = db.list_lists().unwrap().into_iter().map(|l| l.title).collect();
-        assert!(titles[1].ends_with("(importada)"), "{titles:?}");
+        let bundle = export(&db, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap();
+        let ana = import(&db, &bundle, &ImportOptions { owner: Some("Ana".into()) }).unwrap();
+        assert_eq!(ana.matches_created, 4, "mismo contenido, pero de otro perfil: no son duplicados");
+        let ana_id = ana.owner.clone().unwrap().id;
+        assert!(ana.summary().contains("perfil «Ana»"));
 
-        let beto = import(&db, &bundle, &ImportOptions { alias_prefix: Some("Beto".into()) }).unwrap();
-        assert_eq!(beto.favorites_dropped, 2);
-        assert_eq!(db.favorites().unwrap().len(), 4);
+        // Tus datos y estadísticas no cambian; los de Ana quedan aparte y sin prefijo.
+        assert_eq!(db.list_matches(OwnerFilter::Mine).unwrap().len(), 4);
+        assert_eq!(db.stats(OwnerFilter::Mine).unwrap().total_logs, 7);
+        let hers = db.list_matches(OwnerFilter::Owner(ana_id)).unwrap();
+        assert!(hers.iter().any(|m| m.alias == "Crypto Bro de Polanco"));
+        assert_eq!(db.list_lists(OwnerFilter::Owner(ana_id)).unwrap()[0].title, "Citas que debieron quedarse en el chat");
+        // Cada perfil tiene su Top 4: no se pierde ningún favorito.
+        assert_eq!(ana.favorites_dropped, 0);
+        assert_eq!(db.favorites(OwnerFilter::Owner(ana_id)).unwrap().len(), 2);
+        assert_eq!(db.favorites(OwnerFilter::Mine).unwrap().len(), 2);
+
+        // Reimportar en el mismo perfil no duplica; en otro perfil, sí crea copia aparte.
+        let again = import(&db, &bundle, &ImportOptions { owner: Some("ana".into()) }).unwrap();
+        assert_eq!((again.matches_created, again.lists_existing), (0, 1));
+        assert!(again.summary().contains("«Ana»"), "usa el nombre guardado: {}", again.summary());
+        let beto = import(&db, &bundle, &ImportOptions { owner: Some("Beto".into()) }).unwrap();
+        assert_eq!(beto.matches_created, 4);
+        assert_eq!(db.list_owners().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn full_backup_keeps_profiles_separate() {
+        let src = seeded();
+        let bundle = export(&src, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap();
+        import(&src, &bundle, &ImportOptions { owner: Some("Ana".into()) }).unwrap();
+
+        // Respaldo de todo (tuyo + Ana) restaurado sin perfil: cada dato vuelve a su dueño.
+        let everything = roundtrip(&export(&src, ExportTarget::All(OwnerFilter::All), ExportOptions::default()).unwrap());
+        assert_eq!(everything.owner_names(), vec!["Ana".to_string()]);
+        assert!(everything.describe().contains("perfiles: Ana"));
+        let dst = Database::open_in_memory().unwrap();
+        import(&dst, &everything, &ImportOptions::default()).unwrap();
+        assert_eq!(dst.list_matches(OwnerFilter::Mine).unwrap().len(), 4);
+        let owners = dst.list_owners().unwrap();
+        assert_eq!(owners.len(), 1);
+        assert_eq!(dst.list_matches(OwnerFilter::Owner(owners[0].id)).unwrap().len(), 4);
+        assert_eq!(dst.list_lists(OwnerFilter::Owner(owners[0].id)).unwrap().len(), 1);
     }
 
     #[test]
     fn list_export_only_contains_its_matches() {
         let db = seeded();
-        let list_id = find_list(&db, "chat").unwrap();
+        let list_id = find_list(&db, "chat", OwnerFilter::Mine).unwrap();
         let bundle = export(&db, ExportTarget::List(list_id), ExportOptions::default()).unwrap();
         assert_eq!(bundle.kind, ExportKind::Lista);
         assert_eq!(bundle.matches.len(), 3);
         assert_eq!(bundle.lists[0].items.len(), 3);
         assert!(!bundle.matches.iter().any(|m| m.alias.contains("perro")));
 
-        let one = export(&db, ExportTarget::Match(find_match(&db, "perro").unwrap()), ExportOptions::default()).unwrap();
+        let perro = find_match(&db, "perro", OwnerFilter::Mine).unwrap();
+        let one = export(&db, ExportTarget::Match(perro), ExportOptions::default()).unwrap();
         assert_eq!(one.matches.len(), 1);
         assert_eq!(one.matches[0].logs.len(), 3);
         assert!(one.lists.is_empty());
@@ -729,15 +838,15 @@ mod tests {
         m.avatar_path = Some(src.import_photo_bytes(&bytes, "png").unwrap());
         src.insert_match(&m).unwrap();
 
-        let with = roundtrip(&export(&src, ExportTarget::All, ExportOptions::default()).unwrap());
+        let with = roundtrip(&export(&src, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap());
         assert_eq!(with.photo_count(), 1);
         let dst = Database::open_in_memory().unwrap();
         let report = import(&dst, &with, &ImportOptions::default()).unwrap();
         assert_eq!(report.photos_imported, 1);
-        let path = dst.list_matches().unwrap()[0].avatar_path.clone().unwrap();
+        let path = dst.list_matches(OwnerFilter::Mine).unwrap()[0].avatar_path.clone().unwrap();
         assert_eq!(fs::read(&path).unwrap(), bytes);
 
-        let without = export(&src, ExportTarget::All, ExportOptions { include_photos: false }).unwrap();
+        let without = export(&src, ExportTarget::All(OwnerFilter::Mine), ExportOptions { include_photos: false }).unwrap();
         assert_eq!(without.photo_count(), 0);
 
         for p in [m.avatar_path.unwrap(), path] {
@@ -753,24 +862,24 @@ mod tests {
         assert!(from_json(future).unwrap_err().to_string().contains("versión 99"));
 
         let db = seeded();
-        let mut bundle = export(&db, ExportTarget::All, ExportOptions::default()).unwrap();
+        let mut bundle = export(&db, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap();
         bundle.lists[0].items[0].match_key = "m999".into();
         assert!(from_json(&to_json(&bundle).unwrap()).is_err());
 
         // Un fallo a mitad de importación no deja nada a medias.
         let dst = Database::open_in_memory().unwrap();
-        let mut bad = export(&db, ExportTarget::All, ExportOptions::default()).unwrap();
+        let mut bad = export(&db, ExportTarget::All(OwnerFilter::Mine), ExportOptions::default()).unwrap();
         bad.matches[3].logs[0].script_score = Some(9);
         assert!(import(&dst, &bad, &ImportOptions::default()).is_err());
-        assert!(dst.list_matches().unwrap().is_empty());
+        assert!(dst.list_matches(OwnerFilter::Mine).unwrap().is_empty());
     }
 
     #[test]
     fn find_and_slug_helpers() {
         let db = seeded();
-        assert!(find_match(&db, "la").is_err()); // ambiguo
-        assert!(find_match(&db, "zzz").is_err());
-        assert_eq!(find_match(&db, "1").unwrap(), 1);
+        assert!(find_match(&db, "la", OwnerFilter::Mine).is_err()); // ambiguo
+        assert!(find_match(&db, "zzz", OwnerFilter::Mine).is_err());
+        assert_eq!(find_match(&db, "1", OwnerFilter::Mine).unwrap(), 1);
         assert_eq!(slug("Citas que debieron quedarse en el chat"), "citas-que-debieron-quedarse-en-el-chat");
         assert_eq!(slug("La astróloga de la Roma Norte!!"), "la-astrologa-de-la-roma-norte");
         assert_eq!(slug("¿?"), "sin-nombre");
